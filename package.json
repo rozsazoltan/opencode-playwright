@@ -22,7 +22,7 @@
     "type": "git",
     "url": "git+https://github.com/rozsazoltan/opencode-playwright.git"
   },
-  "license": "MIT",
+  "license": "AGPL-3.0-only",
   "dependencies": {
     "@opencode/plugin": "2.0.4",
     "@playwright/mcp": "0.0.82",
