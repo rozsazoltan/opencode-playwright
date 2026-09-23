@@ -303,7 +303,9 @@ export class PlaywrightBridge {
     let extensionToken: string
     try {
       resolvedMcpCli = this.validateWindowsPrerequisites()
-      extensionToken = this.dependencies.readText(this.config.extensionTokenFile).trim()
+      extensionToken =
+        this.dependencies.env.OPENCODE_PLAYWRIGHT_EXTENSION_TOKEN?.trim() ??
+        this.dependencies.readText(this.config.extensionTokenFile).trim()
       if (extensionToken.length === 0) throw new Error("Playwright extension token is empty")
     } catch (error) {
       const safeReasons = [
@@ -475,7 +477,10 @@ export class PlaywrightBridge {
     if (!this.dependencies.fileExists(this.config.browserExecutable)) {
       throw new Error("Brave executable is missing")
     }
-    if (!this.dependencies.fileExists(this.config.extensionTokenFile)) {
+    if (
+      this.dependencies.env.OPENCODE_PLAYWRIGHT_EXTENSION_TOKEN === undefined &&
+      !this.dependencies.fileExists(this.config.extensionTokenFile)
+    ) {
       throw new Error("Playwright extension token file is missing")
     }
     if (!this.dependencies.fileExists(this.config.proxyTokenFile)) {
@@ -579,8 +584,11 @@ export class PlaywrightBridge {
       if (result.kind === "probe" && result.value.mcp) {
         try {
           this.ensureProxyStarted()
-        } catch {
-          return this.failStartup(generation, "Playwright proxy could not start")
+        } catch (error) {
+          const reason = error instanceof Error && error.message === "No WSL NAT client subnets could be detected"
+            ? error.message
+            : "Playwright proxy could not start"
+          return this.failStartup(generation, reason)
         }
         if (result.value.extension) return this.setStatus("ready", undefined, true)
         return this.setStatus("degraded", "Brave extension is not connected", false)

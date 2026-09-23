@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test"
 import { createConnection } from "node:net"
-import { createProxyHandler, startProxy } from "../src/proxy"
+import {
+  createProxyHandler,
+  discoverWslNatCidrs,
+  isAllowedClientAddress,
+  startProxy,
+} from "../src/proxy"
 
 const servers = new Set<ReturnType<typeof Bun.serve>>()
 
@@ -61,6 +66,125 @@ function createTestProxy(bearerToken: string) {
 }
 
 describe("Playwright proxy", () => {
+  test("discovers valid IPv4 subnets only from WSL virtual Ethernet adapters", () => {
+    const discovered = discoverWslNatCidrs({
+      "vEthernet (WSL)": [
+        { address: "172.28.64.1", netmask: "255.255.240.0", family: "IPv4", internal: false, mac: "", cidr: "172.28.64.1/20", scopeid: 0 },
+        { address: "127.0.0.1", netmask: "255.0.0.0", family: "IPv4", internal: true, mac: "", cidr: "127.0.0.1/8", scopeid: 0 },
+        { address: "fe80::1", netmask: "ffff:ffff:ffff:ffff::", family: "IPv6", internal: false, mac: "", cidr: "fe80::1/64", scopeid: 0 },
+        { address: "172.28.1.2", netmask: "255.0.255.0", family: "IPv4", internal: false, mac: "", cidr: "172.28.1.2/16", scopeid: 0 },
+      ],
+      "Ethernet": [
+        { address: "10.0.0.1", netmask: "255.255.255.0", family: "IPv4", internal: false, mac: "", cidr: "10.0.0.1/24", scopeid: 0 },
+      ],
+    })
+
+    expect(discovered).toEqual(["172.28.64.1/20"])
+  })
+
+  test("matches only IPv4 client addresses within valid CIDRs", () => {
+    const cidrs = ["192.0.2.0/24"]
+    expect(isAllowedClientAddress("192.0.2.45", cidrs)).toBe(true)
+    expect(isAllowedClientAddress("192.0.3.45", cidrs)).toBe(false)
+    expect(isAllowedClientAddress("10.0.0.1", cidrs)).toBe(false)
+    expect(isAllowedClientAddress("127.0.0.1", cidrs)).toBe(false)
+    expect(isAllowedClientAddress("::1", cidrs)).toBe(false)
+    expect(isAllowedClientAddress("2001:db8::1", cidrs)).toBe(false)
+    expect(isAllowedClientAddress("::ffff:192.0.2.45", cidrs)).toBe(true)
+    expect(isAllowedClientAddress("::ffff:192.0.3.45", cidrs)).toBe(false)
+    expect(isAllowedClientAddress(null, cidrs)).toBe(false)
+    expect(isAllowedClientAddress("192.0.2.1", ["192.0.2.0/33"])).toBe(false)
+    expect(isAllowedClientAddress("192.0.2.1", ["0.0.0.0/0"])).toBe(false)
+    expect(isAllowedClientAddress("192.0.2.1", ["192.0.2.1/0"])).toBe(false)
+  })
+
+  test("startProxy fails closed when configured client CIDRs are absent or invalid", () => {
+    const options = {
+      hostname: "127.0.0.1",
+      port: 0,
+      targetOrigin: new URL("http://127.0.0.1:1"),
+      bearerToken: "correct-token",
+    }
+    expect(() => startProxy({ ...options, allowedClientCidrs: [] })).toThrow()
+    expect(() => startProxy({ ...options, allowedClientCidrs: ["192.0.2.0/33"] })).toThrow()
+    expect(() => startProxy({ ...options, allowedClientCidrs: ["0.0.0.0/0"] })).toThrow()
+    expect(() => startProxy({ ...options, allowedClientCidrs: ["192.0.2.1/0"] })).toThrow()
+  })
+
+  test("refreshes discovered CIDRs per request and denies requests when discovery disappears", async () => {
+    const { targetOrigin, upstreamRequests } = createTestProxy("correct-token")
+    let discoveryCalls = 0
+    const proxy = startProxy({
+      hostname: "127.0.0.1",
+      port: 0,
+      targetOrigin,
+      bearerToken: "correct-token",
+      discoverClientCidrs: () => {
+        discoveryCalls++
+        if (discoveryCalls === 1) return ["127.0.0.1/32"]
+        if (discoveryCalls === 2) return ["192.0.2.0/24"]
+        return []
+      },
+    })
+
+    try {
+      const response = await fetch(proxy.url, {
+        headers: { authorization: "Bearer correct-token" },
+      })
+      expect(response.status).toBe(403)
+      expect(upstreamRequests()).toBe(0)
+
+      const disappeared = await fetch(proxy.url, {
+        headers: { authorization: "Bearer correct-token" },
+      })
+      expect(disappeared.status).toBe(403)
+      expect(upstreamRequests()).toBe(0)
+      expect(discoveryCalls).toBe(3)
+    } finally {
+      proxy.stop(true)
+    }
+  })
+
+  test("startProxy rejects clients outside its configured subnet before forwarding", async () => {
+    const { targetOrigin, upstreamRequests } = createTestProxy("correct-token")
+    const rejectedProxy = startProxy({
+      hostname: "127.0.0.1",
+      port: 0,
+      targetOrigin,
+      bearerToken: "correct-token",
+      allowedClientCidrs: ["192.0.2.0/24"],
+    })
+
+    try {
+      const rejected = await fetch(rejectedProxy.url, {
+        headers: { authorization: "Bearer correct-token" },
+      })
+      expect(rejected.status).toBe(403)
+      expect(await rejected.text()).toBe("Forbidden")
+      expect(upstreamRequests()).toBe(0)
+    } finally {
+      rejectedProxy.stop(true)
+    }
+
+    const allowedProxy = startProxy({
+      hostname: "127.0.0.1",
+      port: 0,
+      targetOrigin,
+      bearerToken: "correct-token",
+      allowedClientCidrs: ["127.0.0.1/32"],
+    })
+    try {
+      const allowed = await fetch(allowedProxy.url, {
+        headers: { authorization: "Bearer correct-token" },
+      })
+      expect(allowed.status).toBe(200)
+      expect(await allowed.text()).toBe("upstream-stream")
+      expect(upstreamRequests()).toBe(1)
+    } finally {
+      allowedProxy.stop(true)
+    }
+  })
+
   test("rejects a missing bearer token without contacting upstream", async () => {
     const { handler, upstreamRequests } = createTestProxy("correct-token")
 
@@ -165,6 +289,7 @@ describe("Playwright proxy", () => {
       port: 0,
       targetOrigin,
       bearerToken: "correct-token",
+      allowedClientCidrs: ["127.0.0.1/32"],
     })
 
     try {
@@ -210,6 +335,7 @@ describe("Playwright proxy", () => {
         port: 0,
         targetOrigin: new URL(`http://127.0.0.1:${upstream.port}`),
         bearerToken: "correct-token",
+        allowedClientCidrs: ["127.0.0.1/32"],
       })
 
       try {
@@ -244,6 +370,7 @@ describe("Playwright proxy", () => {
         port: 0,
         targetOrigin,
         bearerToken: "correct-token",
+        allowedClientCidrs: ["127.0.0.1/32"],
       })
       const startedAt = performance.now()
       const socket = createConnection({

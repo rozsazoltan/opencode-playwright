@@ -374,6 +374,50 @@ describe("PlaywrightBridge", () => {
     expect(childEnvironment).not.toBe(sourceEnvironment)
   })
 
+  test("Windows uses the trimmed extension token environment override without requiring its file", async () => {
+    const dependencies = fakeDependencies()
+    dependencies.env.OPENCODE_PLAYWRIGHT_EXTENSION_TOKEN = "  environment-token-fixture  \n"
+    const sourceEnvironment = { ...dependencies.env }
+    let childEnvironment: NodeJS.ProcessEnv | undefined
+    dependencies.fileExists = (path) => !path.endsWith("playwright-key")
+    dependencies.readText = (path) => {
+      if (path.endsWith("playwright-key")) throw new Error("token file must not be read")
+      return 'async createTarget(url3) { this._sendToExtension("chrome.tabs.create", [{ url: url3, active: false }]) }'
+    }
+    dependencies.spawn = (_command, _args, options) => {
+      childEnvironment = options.env
+      return { pid: 4242, onExit: () => undefined }
+    }
+
+    const status = await new PlaywrightBridge(dependencies).start()
+
+    expect(status.state).toBe("ready")
+    expect(childEnvironment).toEqual({
+      ...sourceEnvironment,
+      PLAYWRIGHT_MCP_EXTENSION_TOKEN: "environment-token-fixture",
+    })
+  })
+
+  test("Windows rejects an empty extension token environment override before spawning", async () => {
+    const dependencies = fakeDependencies()
+    dependencies.env.OPENCODE_PLAYWRIGHT_EXTENSION_TOKEN = " \t\n "
+    let spawned = false
+    dependencies.fileExists = (path) => !path.endsWith("playwright-key")
+    dependencies.spawn = () => {
+      spawned = true
+      throw new Error("must not spawn")
+    }
+
+    const status = await new PlaywrightBridge(dependencies).start()
+
+    expect(spawned).toBe(false)
+    expect(status).toMatchObject({
+      state: "failed",
+      reason: "Playwright extension token is empty",
+    })
+    expect(status.reason).not.toContain("OPENCODE_PLAYWRIGHT_EXTENSION_TOKEN")
+  })
+
   test("Windows rejects an empty extension token before spawning", async () => {
     const dependencies = fakeDependencies()
     let spawned = false
@@ -438,6 +482,41 @@ describe("PlaywrightBridge", () => {
     expect(receivedBinding).toBe(true)
     expect(status.proxyEndpoint?.href).toBe("http://127.0.0.1:8932/mcp")
     await bridge.stop()
+  })
+
+  test("Windows reports the safe WSL NAT discovery startup reason", async () => {
+    const dependencies = fakeDependencies()
+    dependencies.readText = (path) => path.endsWith("playwright-mcp-proxy-key")
+      ? "proxy-token\n"
+      : 'async createTarget(url3) { this._sendToExtension("chrome.tabs.create", [{ url: url3, active: false }]) }'
+    dependencies.startProxy = () => {
+      throw new Error("No WSL NAT client subnets could be detected")
+    }
+
+    const status = await new PlaywrightBridge(dependencies).start()
+
+    expect(status).toMatchObject({
+      state: "failed",
+      reason: "No WSL NAT client subnets could be detected",
+    })
+  })
+
+  test("Windows keeps a generic proxy startup reason for other errors", async () => {
+    const dependencies = fakeDependencies()
+    dependencies.readText = (path) => path.endsWith("playwright-mcp-proxy-key")
+      ? "proxy-token\n"
+      : 'async createTarget(url3) { this._sendToExtension("chrome.tabs.create", [{ url: url3, active: false }]) }'
+    dependencies.startProxy = () => {
+      throw new Error("private operating system detail")
+    }
+
+    const status = await new PlaywrightBridge(dependencies).start()
+
+    expect(status).toMatchObject({
+      state: "failed",
+      reason: "Playwright proxy could not start",
+    })
+    expect(status.reason).not.toContain("private operating system detail")
   })
 
   test("Windows stops the proxy before requesting child termination", async () => {
