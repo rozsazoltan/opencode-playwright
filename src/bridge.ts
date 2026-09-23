@@ -1,5 +1,6 @@
 import { closeSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { dirname, join, resolve } from "node:path"
+import { patchPlaywrightBundle } from "../scripts/patch-playwright.mjs"
 import { startProxy, type ProxyOptions, type StartedProxy } from "./proxy"
 
 export type BridgeMode = "windows-owner" | "wsl-client"
@@ -46,6 +47,7 @@ export type BridgeDependencies = {
   env: NodeJS.ProcessEnv
   fileExists(path: string): boolean
   readText(path: string): string
+  writeText(path: string, value: string): void
   resolve(name: string): string
   isPortOpen(host: string, port: number): Promise<boolean>
   spawn(command: string, args: string[], options: { cwd: string; env: NodeJS.ProcessEnv }): SpawnedChild
@@ -323,6 +325,8 @@ export class PlaywrightBridge {
         "Playwright core bundle is missing",
         "Playwright core bundle could not be checked",
         "Playwright core bundle could not be read",
+        "Playwright core bundle could not be patched",
+        "Playwright core bundle has an unsupported shape",
         "Playwright background-tab patch is missing",
         "Brave executable is missing",
         "Brave executable could not be checked",
@@ -513,7 +517,24 @@ export class PlaywrightBridge {
     } catch {
       throw new Error("Playwright core bundle could not be read")
     }
-    if (!hasBackgroundTabPatch(coreBundleText)) {
+    let patchedBundleText: string
+    if (hasBackgroundTabPatch(coreBundleText)) {
+      patchedBundleText = coreBundleText
+    } else {
+      try {
+        patchedBundleText = patchPlaywrightBundle(coreBundleText)
+      } catch {
+        throw new Error("Playwright core bundle has an unsupported shape")
+      }
+      if (patchedBundleText !== coreBundleText) {
+        try {
+          this.dependencies.writeText(coreBundle, patchedBundleText)
+        } catch {
+          throw new Error("Playwright core bundle could not be patched")
+        }
+      }
+    }
+    if (!hasBackgroundTabPatch(patchedBundleText)) {
       throw new Error("Playwright background-tab patch is missing")
     }
     this.patchVerified = true

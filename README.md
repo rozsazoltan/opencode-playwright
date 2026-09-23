@@ -107,14 +107,14 @@ the configured extension key; it is not the name of the user-facing override.
 
 ## Playwright focus patch
 
-On installation, the package applies the version-pinned patch to its own resolved
-`playwright-core` bundle. The extension creates new tabs with `active: false`, keeping
-the user's previously active tab focused. The bridge verifies this patch before
-starting the Windows owner and fails closed if the expected bundle shape is not found.
+Before starting the Windows owner, the bridge applies the version-pinned patch to its
+plugin-resolved `playwright-core` bundle. The extension creates new tabs with
+`active: false`, keeping the user's previously active tab focused. The patch is
+idempotent, and the bridge fails closed if the bundle is unavailable, unwritable, or
+does not have the expected shape. WSL clients do not modify a bundle.
 
-The patch runs from the package's `postinstall` script, so install scripts must be
-enabled. The patch artifact under `patches/` is kept for review and reproducibility;
-the install script applies the same narrowly scoped source change.
+The patch artifact under `patches/` is kept for review and reproducibility; the bridge
+applies the same narrowly scoped source change at runtime.
 
 ## Development
 

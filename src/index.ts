@@ -348,6 +348,7 @@ export function createBridge(options: PluginOptions = {}): PlaywrightBridge {
     env,
     fileExists: (path) => existsSync(path),
     readText: (path) => readFileSync(path, "utf8"),
+    writeText: (path, value) => writeFileSync(path, value, "utf8"),
     resolve: (name) => resolver.resolve(name),
     isPortOpen: portOpen,
     spawn: (_command, args, options) => {

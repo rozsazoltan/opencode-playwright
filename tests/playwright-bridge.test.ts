@@ -31,6 +31,7 @@ function fakeDependencies(): BridgeDependencies {
     env: { OPENCODE_CONFIG_DIR: configDir },
     fileExists: () => true,
     readText: () => 'async createTarget(url3) { this._sendToExtension("chrome.tabs.create", [{ url: url3, active: false }]) }',
+    writeText: () => undefined,
     resolve: (name) => name,
     isPortOpen: async () => false,
     spawn: () => ({ pid: 4242, onExit: () => undefined }),
@@ -447,8 +448,53 @@ describe("PlaywrightBridge", () => {
 
     expect(status).toMatchObject({
       state: "failed",
-      reason: "Playwright background-tab patch is missing",
+      reason: "Playwright core bundle has an unsupported shape",
     })
+  })
+
+  test("Windows patches the resolved plugin bundle before spawning and avoids rewriting patched bundles", async () => {
+    const dependencies = fakeDependencies()
+    const bundle = 'async createTarget(url3) {\n        const tab2 = await this._sendToExtension("chrome.tabs.create", [{ url: url3 }]);'
+    let bundleText = bundle
+    const writes: Array<[string, string]> = []
+    dependencies.resolve = (specifier) => specifier === "playwright-core/lib/coreBundle"
+      ? "/plugin/node_modules/playwright-core/lib/coreBundle.js"
+      : specifier
+    dependencies.readText = (path) => path.endsWith("coreBundle.js") ? bundleText : "token"
+    dependencies.writeText = (path, value) => {
+      writes.push([path, value])
+      bundleText = value
+    }
+
+    const bridge = new PlaywrightBridge(dependencies)
+    expect((await bridge.start()).state).toBe("ready")
+    expect(writes).toHaveLength(1)
+    expect(writes[0][0]).toBe("/plugin/node_modules/playwright-core/lib/coreBundle.js")
+    expect(writes[0][1]).toContain('"chrome.tabs.create", [{ url: url3, active: false }]')
+    await bridge.stop()
+
+    dependencies.spawn = () => ({ pid: 4242, onExit: () => undefined })
+    expect((await new PlaywrightBridge(dependencies).start()).state).toBe("ready")
+    expect(writes).toHaveLength(1)
+  })
+
+  test("Windows fails closed without spawning when the resolved bundle cannot be patched", async () => {
+    const dependencies = fakeDependencies()
+    dependencies.readText = (path) => path === "playwright-core/lib/coreBundle"
+      ? 'async createTarget(url3) {\n        const tab2 = await this._sendToExtension("chrome.tabs.create", [{ url: url3 }]);'
+      : "token"
+    dependencies.writeText = () => { throw new Error("private write failure") }
+    let spawned = false
+    dependencies.spawn = () => {
+      spawned = true
+      throw new Error("must not spawn")
+    }
+
+    const status = await new PlaywrightBridge(dependencies).start()
+
+    expect(spawned).toBe(false)
+    expect(status).toMatchObject({ state: "failed", reason: "Playwright core bundle could not be patched" })
+    expect(status.reason).not.toContain("private")
   })
 
   test("Windows reports safe diagnostics for prerequisite operation failures", async () => {
@@ -767,6 +813,10 @@ describe("PlaywrightBridge", () => {
     dependencies.platform = "linux"
     dependencies.env = { WSL_DISTRO_NAME: "Ubuntu" }
     let spawned = false
+    let bundleWritten = false
+    dependencies.writeText = () => {
+      bundleWritten = true
+    }
     dependencies.spawn = () => {
       spawned = true
       throw new Error("must not spawn")
@@ -777,6 +827,7 @@ describe("PlaywrightBridge", () => {
 
     expect(status.mode).toBe("wsl-client")
     expect(spawned).toBe(false)
+    expect(bundleWritten).toBe(false)
   })
 
   test("a listening server without the Brave extension is degraded", async () => {
