@@ -1,0 +1,1654 @@
+import { afterEach, describe, expect, test } from "bun:test"
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import {
+  bridgeConfigFromOptions,
+  configDirectory,
+  createBridge,
+  createDiagnosticLogger,
+  diagnosticLogPath,
+  installBridge,
+  probeMcp,
+  proxyTokenReference,
+  resolveNodeExecutable,
+} from "../src/index"
+import { PlaywrightBridge, type BridgeDependencies, type BridgeStatus } from "../src/bridge"
+import type { ProxyOptions, StartedProxy } from "../src/proxy"
+
+const temporaryDirectories = new Set<string>()
+const nativeFetch = globalThis.fetch
+const patchableBundle = `async createTarget(url3) {
+        const tab2 = await this._sendToExtension("chrome.tabs.create", [{ url: url3 }]);
+        await tab2.page.bringToFront();
+        await tab2.updateWebMCPTools();
+        await context.startRecording();
+        await tab2.page.bringToFront();
+        response2.addTextResult`
+const patchedBundle = `async createTarget(url3) {
+        const tab2 = await this._sendToExtension("chrome.tabs.create", [{ url: url3, active: false }]);
+        // MCP page activation intentionally suppressed.
+        await tab2.updateWebMCPTools();
+        await context.startRecording();
+        // MCP page activation intentionally suppressed.
+        response2.addTextResult`
+
+afterEach(() => {
+  globalThis.fetch = nativeFetch
+  for (const directory of temporaryDirectories) rmSync(directory, { force: true, recursive: true })
+  temporaryDirectories.clear()
+})
+
+function fakeDependencies(): BridgeDependencies {
+  const configDir = mkdtempSync(join(tmpdir(), "playwright-bridge-test-"))
+  temporaryDirectories.add(configDir)
+
+  return {
+    platform: "win32",
+    env: { OPENCODE_CONFIG_DIR: configDir },
+    fileExists: () => true,
+    readText: () => patchedBundle,
+    writeText: () => undefined,
+    resolve: (name) => name,
+    isPortOpen: async () => false,
+    spawn: () => ({ pid: 4242, onExit: () => undefined }),
+    killTree: async () => undefined,
+    sleep: async () => undefined,
+    probeMcp: async () => ({ mcp: true, extension: true }),
+    now: () => new Date("2026-09-21T00:00:00.000Z"),
+    startProxy: () => ({ url: new URL("http://127.0.0.1:8932/mcp"), stop: () => undefined }),
+  }
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise
+  })
+  return { promise, resolve }
+}
+
+function ownerFile(dependencies: BridgeDependencies): string {
+  return join(dependencies.env.OPENCODE_CONFIG_DIR!, "playwright-mcp-owner.json")
+}
+
+function adapterStatus(
+  state: BridgeStatus["state"],
+  mode: BridgeStatus["mode"] = "windows-owner",
+): BridgeStatus {
+  return {
+    mode,
+    state,
+    endpoint: new URL("http://127.0.0.1:8931/mcp"),
+    proxyEndpoint: new URL("http://127.0.0.1:8932/mcp"),
+    proxyRunning: state === "ready",
+    pid: state === "ready" ? 4242 : undefined,
+    patchApplied: state === "ready",
+    extensionConnected: state === "ready",
+    reason: state === "ready" ? undefined : "proxy token=SECRET_MARKER",
+  }
+}
+
+function adapterContext(options: {
+  initialStatus?: BridgeStatus
+  failMcpReload?: boolean
+  failToolTransform?: boolean
+  failCommandTransform?: boolean
+} = {}) {
+  type Invocation = { sessionID: string; prompt: { text: string }; delivery: string }
+  type PromptCall = { sessionID: string; text: string; resume?: boolean }
+  const calls: string[] = []
+  const servers = new Map<string, Record<string, unknown>>()
+  const removedTools: string[] = []
+  const commands = new Map<string, { execute(input: Invocation): Promise<void> }>()
+  const synthetic: string[] = []
+  const prompts: PromptCall[] = []
+  const contextHooks: Array<(input: { system: Array<{ type: string; text: string }> }) => void> = []
+  let toolDisposed = 0
+  let commandDisposed = 0
+  const ctx = {
+    mcp: {
+      transform: async (callback: (editor: any) => void) => {
+        callback({
+          set: (name: string, config: Record<string, unknown>) => servers.set(name, config),
+          remove: (name: string) => {
+            calls.push(`mcp.remove:${name}`)
+            servers.delete(name)
+          },
+        })
+        return { dispose: async () => undefined }
+      },
+      reload: async () => {
+        calls.push("mcp.reload")
+        if (options.failMcpReload) throw new Error("mcp reload failed")
+      },
+    },
+    tool: {
+      transform: async (callback: (editor: any) => void) => {
+        if (options.failToolTransform) throw new Error("tool transform failed")
+        callback({ remove: (name: string) => removedTools.push(name) })
+        return { dispose: async () => { toolDisposed++ } }
+      },
+      reload: async () => undefined,
+    },
+    command: {
+      transform: async (callback: (editor: any) => void) => {
+        if (options.failCommandTransform) throw new Error("command transform failed")
+        callback({ add: (command: { name: string; execute(input: Invocation): Promise<void> }) => commands.set(command.name, command) })
+        return { dispose: async () => { commandDisposed++ } }
+      },
+    },
+    session: {
+      synthetic: async ({ text }: { text: string }) => synthetic.push(text),
+      prompt: async (input: PromptCall) => prompts.push(input),
+      hook: async (_name: "context", callback: (input: { system: Array<{ type: string; text: string }> }) => void) => {
+        contextHooks.push(callback)
+        return { dispose: async () => undefined }
+      },
+    },
+  }
+  return { ctx, calls, servers, removedTools, commands, synthetic, prompts, contextHooks, get toolDisposed() { return toolDisposed }, get commandDisposed() { return commandDisposed } }
+}
+
+function commandInvocation(text = "") {
+  return { sessionID: "session", prompt: { text }, delivery: "inline" }
+}
+
+function fakeAdapterBridge(initialStatus = adapterStatus("ready")) {
+  let current = initialStatus
+  const lifecycle: string[] = []
+  const bridge = {
+    start: async () => {
+      lifecycle.push("start")
+      current = adapterStatus(initialStatus.state, current.mode)
+      return current
+    },
+    stop: async () => {
+      lifecycle.push("stop")
+      current = adapterStatus("stopped", current.mode)
+    },
+    detach: async () => {
+      lifecycle.push("stop")
+      current = adapterStatus("stopped", current.mode)
+    },
+    restart: async () => {
+      lifecycle.push("restart")
+      current = adapterStatus("ready", current.mode)
+      return current
+    },
+    status: () => current,
+  }
+  return { bridge: bridge as unknown as PlaywrightBridge, lifecycle }
+}
+
+describe("playwright bridge plugin options", () => {
+  test("uses the resolved Node executable and falls back when resolution fails", () => {
+    expect(resolveNodeExecutable({ status: 0, stdout: "C:\\tools\\node.exe\r\n" })).toBe(
+      "C:\\tools\\node.exe",
+    )
+    expect(resolveNodeExecutable({ status: 1, stdout: "C:\\tools\\node.exe\n" })).toBe("node")
+    expect(resolveNodeExecutable({ status: 0, stdout: "   " })).toBe("node")
+  })
+
+  test("accepts a configured directory containing opencode.json", () => {
+    const environment = { OPENCODE_CONFIG_DIR: "C:\\configured" }
+    const exists = (path: string) => path === join(environment.OPENCODE_CONFIG_DIR, "opencode.json")
+
+    expect(configDirectory(environment, "C:\\home", exists)).toBe(environment.OPENCODE_CONFIG_DIR)
+  })
+
+  test("accepts a configured directory containing opencode.jsonc", () => {
+    const environment = { OPENCODE_CONFIG_DIR: "C:\\configured" }
+    const exists = (path: string) => path === join(environment.OPENCODE_CONFIG_DIR, "opencode.jsonc")
+
+    expect(configDirectory(environment, "C:\\home", exists)).toBe(environment.OPENCODE_CONFIG_DIR)
+  })
+
+  test("falls back when the configured directory contains neither config file", () => {
+    const environment = { OPENCODE_CONFIG_DIR: "\\" }
+    const exists = () => false
+
+    expect(configDirectory(environment, "C:\\home", exists)).toBe(join("C:\\home", ".config", "opencode"))
+  })
+
+  test("falls back when OPENCODE_CONFIG_DIR is absent", () => {
+    const exists = () => false
+
+    expect(configDirectory({}, "C:\\home", exists)).toBe(join("C:\\home", ".config", "opencode"))
+  })
+
+  test("resolves error diagnostics to the OpenCode log directory without exposing secrets", () => {
+    expect(diagnosticLogPath({ XDG_DATA_HOME: "/data/custom" }, "/home/test")).toBe(
+      join("/data/custom", "opencode", "log", "opencode-playwright-bridge.log"),
+    )
+    expect(diagnosticLogPath({}, "/home/test")).toBe(
+      join("/home/test", ".local", "share", "opencode", "log", "opencode-playwright-bridge.log"),
+    )
+
+    const dataHome = mkdtempSync(join(tmpdir(), "playwright-log-test-"))
+    temporaryDirectories.add(dataHome)
+    createDiagnosticLogger({ XDG_DATA_HOME: dataHome }, "/unused")(
+      "Bridge failed with Bearer sensitive-marker",
+    )
+    const output = readFileSync(diagnosticLogPath({ XDG_DATA_HOME: dataHome }), "utf8")
+    expect(output).toContain("Bearer [redacted]")
+    expect(output).not.toContain("sensitive-marker")
+  })
+
+  test("maps owner options and normalizes a non-loopback Playwright host", () => {
+    const configDir = mkdtempSync(join(tmpdir(), "playwright-options-owner-"))
+    temporaryDirectories.add(configDir)
+    const config = bridgeConfigFromOptions(
+      {
+        playwrightPort: 9041,
+        proxyPort: 9042,
+        playwrightHost: "192.168.1.20",
+        proxyHost: "192.168.1.21",
+        browserExecutable: "C:\\Brave\\brave.exe",
+        profileDirName: "Profile 2",
+        extensionTokenFile: ".secrets/extension-token",
+        proxyTokenFile: ".secrets/owner-proxy-token",
+         startupTimeoutMs: 3210,
+         shutdownTimeoutMs: 6543,
+      },
+      configDir,
+      {},
+    )
+
+    expect(config).toMatchObject({
+      playwrightPort: 9041,
+      proxyPort: 9042,
+      playwrightHost: "127.0.0.1",
+      proxyHost: "192.168.1.21",
+      browserExecutable: "C:\\Brave\\brave.exe",
+      profileDirName: "Profile 2",
+      extensionTokenFile: join(configDir, ".secrets", "extension-token"),
+      proxyTokenFile: join(configDir, ".secrets", "owner-proxy-token"),
+       startupTimeoutMs: 3210,
+       shutdownTimeoutMs: 6543,
+    })
+  })
+
+  test("maps WSL overrides and keeps the MCP file reference token-free", () => {
+    const configDir = mkdtempSync(join(tmpdir(), "playwright-options-wsl-"))
+    temporaryDirectories.add(configDir)
+    const options = {
+      playwrightPort: 9041,
+      proxyPort: 9042,
+      playwrightHost: "127.0.0.1",
+      proxyHost: "0.0.0.0",
+      extensionTokenFile: ".secrets/wsl-extension-token",
+      proxyTokenFile: ".secrets/wsl-proxy-token",
+       startupTimeoutMs: 4321,
+       shutdownTimeoutMs: 7654,
+    }
+    const config = bridgeConfigFromOptions(options, configDir, {
+      WSL_DISTRO_NAME: "Ubuntu",
+      OPENCODE_PLAYWRIGHT_WINDOWS_HOST: "172.20.0.1",
+    })
+
+    expect(config).toMatchObject({
+      playwrightPort: 9041,
+      proxyPort: 9042,
+      playwrightHost: "127.0.0.1",
+      proxyHost: "0.0.0.0",
+      proxyTokenFile: join(configDir, ".secrets", "wsl-proxy-token"),
+       startupTimeoutMs: 4321,
+       shutdownTimeoutMs: 7654,
+    })
+    expect(proxyTokenReference(options, {})).toBe("./.secrets/wsl-proxy-token")
+    expect(proxyTokenReference({}, {})).toBe("./.secrets/playwright-mcp-proxy-key")
+  })
+})
+
+describe("MCP readiness probe", () => {
+  test("performs a successful Streamable HTTP initialize handshake", async () => {
+    const requests: RequestInit[] = []
+    globalThis.fetch = (async (_input, init) => {
+      requests.push(init ?? {})
+      if (requests.length === 1) {
+        return new Response(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            result: { protocolVersion: "2025-03-26", capabilities: {}, serverInfo: {} },
+          }),
+          {
+            headers: { "content-type": "application/json", "mcp-session-id": "session-fixture" },
+          },
+        )
+      }
+      return new Response(null, { status: 202 })
+    }) as typeof fetch
+
+    await expect(probeMcp(new URL("http://127.0.0.1:8931/mcp"))).resolves.toEqual({
+      mcp: true,
+      extension: true,
+    })
+
+    expect(requests).toHaveLength(2)
+    expect(requests[0].method).toBe("POST")
+    expect(requests[0].headers).toEqual({
+      Accept: "application/json, text/event-stream",
+      "Content-Type": "application/json",
+    })
+    expect(JSON.parse(String(requests[0].body))).toMatchObject({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+    })
+    expect(requests[1].headers).toEqual({
+      Accept: "application/json, text/event-stream",
+      "Content-Type": "application/json",
+      "Mcp-Protocol-Version": "2025-03-26",
+      "Mcp-Session-Id": "session-fixture",
+    })
+  })
+
+  test("sends the optional bearer token on each request in an authenticated probe", async () => {
+    const requests: RequestInit[] = []
+    globalThis.fetch = (async (_input, init) => {
+      requests.push(init ?? {})
+      return new Response(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          result: { protocolVersion: "2025-03-26", capabilities: {}, serverInfo: {} },
+        }),
+        { headers: { "content-type": "application/json", "mcp-session-id": "session-fixture" } },
+      )
+    }) as typeof fetch
+
+    await expect(probeMcp(new URL("http://127.0.0.1:8932/mcp"), "probe-token-fixture")).resolves.toEqual({
+      mcp: true,
+      extension: true,
+    })
+
+    expect(requests[0].headers).toMatchObject({ Authorization: "Bearer probe-token-fixture" })
+    expect(requests[1].headers).toMatchObject({ Authorization: "Bearer probe-token-fixture" })
+  })
+
+  test("rejects an unsuccessful initialize response", async () => {
+    globalThis.fetch = (async () =>
+      new Response(
+        JSON.stringify({ jsonrpc: "2.0", id: 1, error: { code: -32600, message: "invalid" } }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      )) as typeof fetch
+
+    await expect(probeMcp(new URL("http://127.0.0.1:8931/mcp"))).resolves.toEqual({
+      mcp: false,
+      extension: false,
+    })
+  })
+
+  test(
+    "aborts and cleans up a timed-out initialize request",
+    async () => {
+      let aborted = false
+      globalThis.fetch = (async (_input, init) => {
+        init?.signal?.addEventListener("abort", () => {
+          aborted = true
+        })
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true })
+        })
+      }) as typeof fetch
+
+      await expect(probeMcp(new URL("http://127.0.0.1:8931/mcp"))).resolves.toEqual({
+        mcp: false,
+        extension: false,
+      })
+      expect(aborted).toBe(true)
+    },
+    1_500,
+  )
+})
+
+describe("bridge port detection", () => {
+  test("detects an IPv6-only loopback listener without claiming its ownership", async () => {
+    const requests: string[] = []
+    const wslDistroName = process.env.WSL_DISTRO_NAME
+    const wslInterop = process.env.WSL_INTEROP
+    delete process.env.WSL_DISTRO_NAME
+    delete process.env.WSL_INTEROP
+    globalThis.fetch = (async (input) => {
+      const address = String(input)
+      requests.push(address)
+      if (address.startsWith("http://127.0.0.1:")) throw new Error("IPv4 is not listening")
+      return new Response(null, { status: 404 })
+    }) as typeof fetch
+
+    const bridge = createBridge({
+      playwrightHost: "localhost",
+      playwrightPort: 8931,
+      ownerLifecycleRequest: async () => undefined,
+    })
+    const status = await bridge.start()
+    if (wslDistroName === undefined) delete process.env.WSL_DISTRO_NAME
+    else process.env.WSL_DISTRO_NAME = wslDistroName
+    if (wslInterop === undefined) delete process.env.WSL_INTEROP
+    else process.env.WSL_INTEROP = wslInterop
+
+    expect(requests).toEqual(["http://127.0.0.1:8931", "http://[::1]:8931"])
+    expect(status.endpoint.href).toBe("http://localhost:8931/mcp")
+    expect(status.state).toBe("failed")
+    expect(status.reason).toBe("foreign-owned port is already listening")
+    await bridge.stop()
+  })
+})
+
+describe("PlaywrightBridge", () => {
+  test("Windows passes the trimmed extension token only to the MCP child environment", async () => {
+    const dependencies = fakeDependencies()
+    const sourceEnvironment = dependencies.env
+    const sourceEnvironmentSnapshot = { ...sourceEnvironment }
+    let childEnvironment: NodeJS.ProcessEnv | undefined
+    dependencies.readText = (path) =>
+      path.endsWith("playwright-key")
+        ? "  extension-token-fixture  \n"
+        : patchedBundle
+    dependencies.spawn = (_command, _args, options) => {
+      childEnvironment = options.env
+      return { pid: 4242, onExit: () => undefined }
+    }
+
+    await new PlaywrightBridge(dependencies).start()
+
+    expect(sourceEnvironment).toEqual(sourceEnvironmentSnapshot)
+    expect(childEnvironment).toEqual({
+      ...sourceEnvironmentSnapshot,
+      PLAYWRIGHT_MCP_EXTENSION_TOKEN: "extension-token-fixture",
+    })
+    expect(childEnvironment).not.toBe(sourceEnvironment)
+  })
+
+  test("Windows uses the trimmed extension token environment override without requiring its file", async () => {
+    const dependencies = fakeDependencies()
+    dependencies.env.OPENCODE_PLAYWRIGHT_EXTENSION_TOKEN = "  environment-token-fixture  \n"
+    const sourceEnvironment = { ...dependencies.env }
+    let childEnvironment: NodeJS.ProcessEnv | undefined
+    dependencies.fileExists = (path) => !path.endsWith("playwright-key")
+    dependencies.readText = (path) => {
+      if (path.endsWith("playwright-key")) throw new Error("token file must not be read")
+      return patchedBundle
+    }
+    dependencies.spawn = (_command, _args, options) => {
+      childEnvironment = options.env
+      return { pid: 4242, onExit: () => undefined }
+    }
+
+    const status = await new PlaywrightBridge(dependencies).start()
+
+    expect(status.state).toBe("ready")
+    expect(childEnvironment).toEqual({
+      ...sourceEnvironment,
+      PLAYWRIGHT_MCP_EXTENSION_TOKEN: "environment-token-fixture",
+    })
+  })
+
+  test("Windows rejects an empty extension token environment override before spawning", async () => {
+    const dependencies = fakeDependencies()
+    dependencies.env.OPENCODE_PLAYWRIGHT_EXTENSION_TOKEN = " \t\n "
+    let spawned = false
+    dependencies.fileExists = (path) => !path.endsWith("playwright-key")
+    dependencies.spawn = () => {
+      spawned = true
+      throw new Error("must not spawn")
+    }
+
+    const status = await new PlaywrightBridge(dependencies).start()
+
+    expect(spawned).toBe(false)
+    expect(status).toMatchObject({
+      state: "failed",
+      reason: "Playwright extension token is empty",
+    })
+    expect(status.reason).not.toContain("OPENCODE_PLAYWRIGHT_EXTENSION_TOKEN")
+  })
+
+  test("Windows rejects an empty extension token before spawning", async () => {
+    const dependencies = fakeDependencies()
+    let spawned = false
+    dependencies.readText = (path) =>
+      path.endsWith("playwright-key")
+        ? " \n\t "
+        : patchedBundle
+    dependencies.spawn = () => {
+      spawned = true
+      throw new Error("must not spawn")
+    }
+
+    const status = await new PlaywrightBridge(dependencies).start()
+
+    expect(spawned).toBe(false)
+    expect(status).toMatchObject({
+      state: "failed",
+      reason: "Playwright extension token is empty",
+    })
+  })
+
+  test("Windows reports when the background-tab patch is missing", async () => {
+    const dependencies = fakeDependencies()
+    dependencies.readText = () => "async createTarget(url3) {}"
+
+    const status = await new PlaywrightBridge(dependencies).start()
+
+    expect(status).toMatchObject({
+      state: "failed",
+      reason: "Playwright core bundle has an unsupported shape",
+    })
+  })
+
+  test("Windows patches the resolved plugin bundle before spawning and avoids rewriting patched bundles", async () => {
+    const dependencies = fakeDependencies()
+    const bundle = patchableBundle
+    let bundleText = bundle
+    const writes: Array<[string, string]> = []
+    dependencies.resolve = (specifier) => specifier === "playwright-core/lib/coreBundle"
+      ? "/plugin/node_modules/playwright-core/lib/coreBundle.js"
+      : specifier
+    dependencies.readText = (path) => path.endsWith("coreBundle.js") ? bundleText : "token"
+    dependencies.writeText = (path, value) => {
+      writes.push([path, value])
+      bundleText = value
+    }
+
+    const bridge = new PlaywrightBridge(dependencies)
+    expect((await bridge.start()).state).toBe("ready")
+    expect(writes).toHaveLength(1)
+    expect(writes[0][0]).toBe("/plugin/node_modules/playwright-core/lib/coreBundle.js")
+    expect(writes[0][1]).toContain('"chrome.tabs.create", [{ url: url3, active: false }]')
+    await bridge.stop()
+
+    dependencies.spawn = () => ({ pid: 4242, onExit: () => undefined })
+    expect((await new PlaywrightBridge(dependencies).start()).state).toBe("ready")
+    expect(writes).toHaveLength(1)
+  })
+
+  test("Windows upgrades an older background-tab-only patch to suppress all MCP activation", async () => {
+    const dependencies = fakeDependencies()
+    const olderPatchedBundle = patchableBundle.replace(
+      'chrome.tabs.create", [{ url: url3 }]',
+      'chrome.tabs.create", [{ url: url3, active: false }]',
+    )
+    let bundleText = olderPatchedBundle
+    const writes: string[] = []
+    dependencies.readText = (path) => path.endsWith("coreBundle") ? bundleText : "token"
+    dependencies.writeText = (_path, value) => {
+      writes.push(value)
+      bundleText = value
+    }
+
+    const status = await new PlaywrightBridge(dependencies).start()
+
+    expect(status.state).toBe("ready")
+    expect(writes).toHaveLength(1)
+    expect(writes[0]).toContain("chrome.tabs.create\", [{ url: url3, active: false }]")
+    expect(writes[0]).not.toContain("bringToFront")
+    await new PlaywrightBridge(dependencies).stop()
+  })
+
+  test("Windows reports safe filesystem codes when bundle patching fails without spawning", async () => {
+    const dependencies = fakeDependencies()
+    dependencies.readText = (path) => path === "playwright-core/lib/coreBundle"
+      ? patchableBundle
+      : "token"
+    dependencies.writeText = () => {
+      throw Object.assign(
+        new Error("C:\\private\\user\\node_modules\\coreBundle.js: access denied"),
+        { code: "EACCES" },
+      )
+    }
+    let spawned = false
+    dependencies.spawn = () => {
+      spawned = true
+      throw new Error("must not spawn")
+    }
+
+    const status = await new PlaywrightBridge(dependencies).start()
+
+    expect(spawned).toBe(false)
+    expect(status).toMatchObject({ state: "failed", reason: "Playwright core bundle could not be patched (EACCES, Error)" })
+    expect(status.reason).not.toContain("private")
+    expect(status.reason).not.toContain("coreBundle.js")
+    expect(status.reason).not.toContain("access denied")
+  })
+
+  test("Windows reports allowlisted error names and codes while redacting unknown details", async () => {
+    const dependencies = fakeDependencies()
+    dependencies.readText = (path) => path === "playwright-core/lib/coreBundle"
+      ? patchableBundle
+      : "token"
+    dependencies.writeText = () => {
+      throw Object.assign(new TypeError("C:\\private\\user\\secret details"), {
+        code: "EACCES",
+        path: "C:\\private\\user\\coreBundle.js",
+      })
+    }
+    let spawned = false
+    dependencies.spawn = () => {
+      spawned = true
+      throw new Error("must not spawn")
+    }
+
+    const status = await new PlaywrightBridge(dependencies).start()
+
+    expect(spawned).toBe(false)
+    expect(status).toMatchObject({
+      state: "failed",
+      reason: "Playwright core bundle could not be patched (EACCES, TypeError)",
+    })
+    expect(status.reason).not.toContain("private")
+    expect(status.reason).not.toContain("secret details")
+    expect(status.reason).not.toContain("coreBundle.js")
+    expect(status.reason).not.toContain("path")
+  })
+
+  test("Windows redacts unrecognized bundle patch error names and codes", async () => {
+    const dependencies = fakeDependencies()
+    dependencies.readText = (path) => path === "playwright-core/lib/coreBundle"
+      ? patchableBundle
+      : "token"
+    dependencies.writeText = () => {
+      throw Object.assign(new Error("private failure"), {
+        name: "PrivateErrorName",
+        code: "PRIVATE_CODE",
+      })
+    }
+
+    const status = await new PlaywrightBridge(dependencies).start()
+
+    expect(status.reason).toBe("Playwright core bundle could not be patched")
+    expect(status.reason).not.toContain("PrivateErrorName")
+    expect(status.reason).not.toContain("PRIVATE_CODE")
+    expect(status.reason).not.toContain("private failure")
+  })
+
+  test("Windows identifies a missing bundle patch writer without spawning", async () => {
+    const dependencies = fakeDependencies()
+    dependencies.readText = (path) => path === "playwright-core/lib/coreBundle"
+      ? patchableBundle
+      : "token"
+    dependencies.writeText = undefined as unknown as BridgeDependencies["writeText"]
+    let spawned = false
+    dependencies.spawn = () => {
+      spawned = true
+      throw new Error("must not spawn")
+    }
+
+    const status = await new PlaywrightBridge(dependencies).start()
+
+    expect(spawned).toBe(false)
+    expect(status).toMatchObject({
+      state: "failed",
+      reason: "Playwright core bundle patch writer is unavailable",
+    })
+  })
+
+  test("Windows reports safe diagnostics for prerequisite operation failures", async () => {
+    const scenarios: Array<{
+      expected: string
+      fail(dependencies: BridgeDependencies): void
+    }> = [
+      {
+        expected: "Playwright MCP package could not be resolved",
+        fail: (dependencies) => {
+          dependencies.resolve = () => {
+            throw new Error("C:\\private\\user\\node_modules\\package.json")
+          }
+        },
+      },
+      {
+        expected: "Playwright prerequisite check failed unexpectedly",
+        fail: (dependencies) => {
+          dependencies.resolve = () => undefined as unknown as string
+        },
+      },
+      {
+        expected: "Playwright core bundle could not be resolved",
+        fail: (dependencies) => {
+          dependencies.resolve = (specifier) => {
+            if (specifier === "playwright-core/lib/coreBundle") {
+              throw new Error("C:\\private\\user\\node_modules\\coreBundle.js")
+            }
+            return specifier
+          }
+        },
+      },
+      {
+        expected: "Playwright core bundle could not be read",
+        fail: (dependencies) => {
+          dependencies.readText = (path) => {
+            if (path === "playwright-core/lib/coreBundle") throw new Error("permission denied")
+            return "token"
+          }
+        },
+      },
+      {
+        expected: "Playwright extension token file could not be read",
+        fail: (dependencies) => {
+          dependencies.readText = (path) => {
+            if (path.endsWith("playwright-mcp-proxy-key")) return "generated-proxy-token"
+            if (path === "playwright-core/lib/coreBundle") {
+              return patchedBundle
+            }
+            if (path.endsWith("playwright-key")) throw new Error("C:\\private\\secrets\\playwright-key")
+            return "unexpected"
+          }
+        },
+      },
+    ]
+
+    for (const scenario of scenarios) {
+      const dependencies = fakeDependencies()
+      scenario.fail(dependencies)
+
+      const status = await new PlaywrightBridge(dependencies).start()
+
+      expect(status).toMatchObject({ state: "failed", reason: scenario.expected })
+      expect(status.reason).not.toContain("private")
+    }
+  })
+
+  test("Windows starts the authenticated proxy only after loopback MCP readiness", async () => {
+    const dependencies = fakeDependencies()
+    const events: string[] = []
+    let receivedSeparateToken = false
+    let receivedLoopbackTarget = false
+    let receivedBinding = false
+    dependencies.readText = (path) => {
+       if (path.endsWith("playwright-mcp-proxy-key")) return "proxy-token\n"
+      return patchedBundle
+    }
+    dependencies.probeMcp = async () => {
+      events.push("probe")
+      return { mcp: true, extension: true }
+    }
+    dependencies.startProxy = (options: ProxyOptions): StartedProxy => {
+      events.push("proxy-start")
+      receivedSeparateToken = options.bearerToken === "proxy-token"
+      receivedLoopbackTarget = options.targetOrigin.href === "http://127.0.0.1:8931/mcp"
+       receivedBinding = options.hostname === "192.168.50.10" && options.port === 8932
+      return { url: new URL("http://127.0.0.1:8932/mcp"), stop: () => undefined }
+    }
+
+     const bridge = new PlaywrightBridge(dependencies, { proxyHost: "192.168.50.10" })
+    const status = await bridge.start()
+
+    expect(events).toEqual(["probe", "proxy-start"])
+    expect(receivedSeparateToken).toBe(true)
+    expect(receivedLoopbackTarget).toBe(true)
+    expect(receivedBinding).toBe(true)
+    expect(status.proxyEndpoint?.href).toBe("http://127.0.0.1:8932/mcp")
+    await bridge.stop()
+  })
+
+  test("Windows reports the safe WSL NAT discovery startup reason", async () => {
+    const dependencies = fakeDependencies()
+    dependencies.readText = (path) => path.endsWith("playwright-mcp-proxy-key")
+      ? "proxy-token\n"
+      : patchedBundle
+    dependencies.startProxy = () => {
+      throw new Error("No WSL NAT client subnets could be detected")
+    }
+
+    const status = await new PlaywrightBridge(dependencies).start()
+
+    expect(status).toMatchObject({
+      state: "failed",
+      reason: "No WSL NAT client subnets could be detected",
+    })
+  })
+
+  test("Windows keeps a generic proxy startup reason for other errors", async () => {
+    const dependencies = fakeDependencies()
+    dependencies.readText = (path) => path.endsWith("playwright-mcp-proxy-key")
+      ? "proxy-token\n"
+      : patchedBundle
+    dependencies.startProxy = () => {
+      throw new Error("private operating system detail")
+    }
+
+    const status = await new PlaywrightBridge(dependencies).start()
+
+    expect(status).toMatchObject({
+      state: "failed",
+      reason: "Playwright proxy could not start",
+    })
+    expect(status.reason).not.toContain("private operating system detail")
+  })
+
+  test("Windows stops the proxy before requesting child termination", async () => {
+    const dependencies = fakeDependencies()
+    const events: string[] = []
+    dependencies.startProxy = () => ({
+      url: new URL("http://127.0.0.1:8932/mcp"),
+      stop: () => events.push("proxy-stop"),
+    })
+    dependencies.gracefulKillTree = async () => {
+      events.push("child-graceful")
+    }
+    dependencies.waitForExit = async () => false
+    dependencies.killTree = async () => {
+      events.push("child-force")
+    }
+
+    const bridge = new PlaywrightBridge(dependencies)
+    await bridge.start()
+    await bridge.stop()
+
+    expect(events).toEqual(["proxy-stop", "child-graceful", "child-force"])
+  })
+
+  test("Windows graceful shutdown does not force-kill an exited child", async () => {
+    const dependencies = fakeDependencies()
+    const events: string[] = []
+    let onExit: ((code: number | null) => void) | undefined
+    dependencies.spawn = () => ({
+      pid: 4242,
+      onExit: (listener) => {
+        onExit = listener
+      },
+    })
+    dependencies.gracefulKillTree = async (pid) => {
+      events.push(`graceful:${pid}`)
+      onExit!(0)
+    }
+    dependencies.killTree = async () => {
+      events.push("force")
+    }
+
+    const bridge = new PlaywrightBridge(dependencies, { shutdownTimeoutMs: 20 })
+    await bridge.start()
+    await bridge.stop()
+
+    expect(events).toEqual(["graceful:4242"])
+    expect(bridge.status().state).toBe("stopped")
+    expect(existsSync(ownerFile(dependencies))).toBe(false)
+  })
+
+  test("Windows shutdown force-kills exactly once after the graceful timeout", async () => {
+    const dependencies = fakeDependencies()
+    const events: string[] = []
+    dependencies.gracefulKillTree = async (pid) => {
+      events.push(`graceful:${pid}`)
+    }
+    dependencies.waitForExit = async (pid, timeoutMs) => {
+      events.push(`wait:${pid}:${timeoutMs}`)
+      return false
+    }
+    dependencies.killTree = async (pid) => {
+      events.push(`force:${pid}`)
+    }
+
+    const bridge = new PlaywrightBridge(dependencies, { shutdownTimeoutMs: 37 })
+    await bridge.start()
+    await bridge.stop()
+
+    expect(events).toEqual(["graceful:4242", "wait:4242:37", "force:4242"])
+    expect(bridge.status().state).toBe("stopped")
+    expect(existsSync(ownerFile(dependencies))).toBe(false)
+  })
+
+  test("graceful shutdown errors still force-clean the owned child", async () => {
+    const dependencies = fakeDependencies()
+    const events: string[] = []
+    dependencies.gracefulKillTree = async () => {
+      events.push("graceful")
+      throw new Error("secret graceful failure")
+    }
+    dependencies.killTree = async () => {
+      events.push("force")
+    }
+
+    const bridge = new PlaywrightBridge(dependencies)
+    await bridge.start()
+    await expect(bridge.stop()).rejects.toThrow("graceful shutdown failed")
+
+    expect(events).toEqual(["graceful", "force"])
+    expect(bridge.status().state).toBe("stopped")
+    expect(existsSync(ownerFile(dependencies))).toBe(false)
+  })
+
+  test("WSL constructs the Windows proxy endpoint without starting a proxy", async () => {
+    const dependencies = fakeDependencies()
+    dependencies.platform = "linux"
+    dependencies.env = {
+      WSL_DISTRO_NAME: "Ubuntu",
+      OPENCODE_PLAYWRIGHT_WINDOWS_HOST: "172.20.0.1",
+      OPENCODE_PLAYWRIGHT_PROXY_PORT: "9342",
+    }
+    let proxyStarted = false
+    let probeToken: string | undefined
+    dependencies.readText = (path) =>
+      path.endsWith("playwright-mcp-proxy-key")
+        ? "wsl-proxy-token-fixture\n"
+        : patchedBundle
+    dependencies.probeMcp = async (_endpoint, bearerToken) => {
+      probeToken = bearerToken
+      return { mcp: true, extension: true }
+    }
+    dependencies.startProxy = () => {
+      proxyStarted = true
+      throw new Error("must not start proxy")
+    }
+
+    const status = await new PlaywrightBridge(dependencies).start()
+
+    expect(proxyStarted).toBe(false)
+    expect(status.proxyEndpoint?.href).toBe("http://172.20.0.1:9342/mcp")
+    expect(status.proxyRunning).toBe(true)
+    expect(probeToken).toBe("wsl-proxy-token-fixture")
+  })
+
+  test("WSL prefers the default route gateway over the resolv.conf nameserver", async () => {
+    const dependencies = fakeDependencies()
+    dependencies.platform = "linux"
+    dependencies.env = { WSL_DISTRO_NAME: "Ubuntu" }
+    dependencies.readText = (path) => {
+      if (path === "/proc/net/route") {
+        return [
+          "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT",
+          "eth0\t00000000\t010011AC\t0003\t0\t0\t100\t00000000\t0\t0\t0",
+        ].join("\n")
+      }
+      if (path === "/etc/resolv.conf") return "nameserver 10.0.0.53\n"
+      if (path.endsWith("playwright-mcp-proxy-key")) return "wsl-proxy-token-fixture\n"
+      return patchedBundle
+    }
+    dependencies.probeMcp = async () => ({ mcp: true, extension: true })
+
+    const status = await new PlaywrightBridge(dependencies).start()
+
+    expect(status.endpoint.href).toBe("http://172.17.0.1:8931/mcp")
+    expect(status.proxyEndpoint?.href).toBe("http://172.17.0.1:8932/mcp")
+  })
+
+  test("WSL falls back to the resolv.conf nameserver when the route is malformed", async () => {
+    const dependencies = fakeDependencies()
+    dependencies.platform = "linux"
+    dependencies.env = { WSL_DISTRO_NAME: "Ubuntu" }
+    dependencies.readText = (path) => {
+      if (path === "/proc/net/route") return "eth0 00000000 not-an-ip"
+      if (path === "/etc/resolv.conf") return "nameserver 10.0.0.53\n"
+      if (path.endsWith("playwright-mcp-proxy-key")) return "wsl-proxy-token-fixture\n"
+      return patchedBundle
+    }
+    dependencies.probeMcp = async () => ({ mcp: true, extension: true })
+
+    const status = await new PlaywrightBridge(dependencies).start()
+
+    expect(status.proxyEndpoint?.href).toBe("http://10.0.0.53:8932/mcp")
+  })
+
+  test("WSL falls back to loopback when the route and resolv.conf are unavailable", async () => {
+    const dependencies = fakeDependencies()
+    dependencies.platform = "linux"
+    dependencies.env = { WSL_DISTRO_NAME: "Ubuntu" }
+    dependencies.readText = (path) => {
+      if (path === "/proc/net/route" || path === "/etc/resolv.conf") throw new Error("missing")
+      if (path.endsWith("playwright-mcp-proxy-key")) return "wsl-proxy-token-fixture\n"
+      return patchedBundle
+    }
+    dependencies.probeMcp = async () => ({ mcp: true, extension: true })
+
+    const status = await new PlaywrightBridge(dependencies).start()
+
+    expect(status.endpoint.href).toBe("http://127.0.0.1:8931/mcp")
+    expect(status.proxyEndpoint?.href).toBe("http://127.0.0.1:8932/mcp")
+  })
+
+  test("WSL never spawns a local Playwright process", async () => {
+    const dependencies = fakeDependencies()
+    dependencies.platform = "linux"
+    dependencies.env = { WSL_DISTRO_NAME: "Ubuntu" }
+    let spawned = false
+    let bundleWritten = false
+    dependencies.writeText = () => {
+      bundleWritten = true
+    }
+    dependencies.spawn = () => {
+      spawned = true
+      throw new Error("must not spawn")
+    }
+
+    const bridge = new PlaywrightBridge(dependencies)
+    const status = await bridge.start()
+
+    expect(status.mode).toBe("wsl-client")
+    expect(spawned).toBe(false)
+    expect(bundleWritten).toBe(false)
+  })
+
+  test("a listening server without the Brave extension is degraded", async () => {
+    const dependencies = fakeDependencies()
+    dependencies.probeMcp = async () => ({ mcp: true, extension: false })
+
+    const bridge = new PlaywrightBridge(dependencies)
+    const status = await bridge.start()
+
+    expect(status.state).toBe("degraded")
+    expect(status.reason).toContain("extension")
+    await bridge.stop()
+  })
+
+  test("does not kill an unrelated process on an occupied port", async () => {
+    const dependencies = fakeDependencies()
+    dependencies.isPortOpen = async () => true
+    let killed = false
+    dependencies.killTree = async () => {
+      killed = true
+    }
+
+    const status = await new PlaywrightBridge(dependencies).start()
+
+    expect(status.state).toBe("failed")
+    expect(status.reason).toContain("foreign-owned port")
+    expect(killed).toBe(false)
+  })
+
+  test("stopping kills only the tracked child", async () => {
+    const dependencies = fakeDependencies()
+    let killedPid: number | undefined
+    dependencies.killTree = async (pid) => {
+      killedPid = pid
+    }
+
+    const bridge = new PlaywrightBridge(dependencies)
+    await bridge.start()
+    await bridge.stop()
+
+    expect(killedPid).toBe(4242)
+    expect(bridge.status().state).toBe("stopped")
+  })
+
+  test("a child exit during a readiness probe cannot be overwritten by the late probe result", async () => {
+    const dependencies = fakeDependencies()
+    const probeStarted = deferred<void>()
+    const probeResult = deferred<{ mcp: boolean; extension: boolean }>()
+    let onExit: ((code: number | null) => void) | undefined
+    dependencies.spawn = () => ({
+      pid: 4242,
+      onExit: (listener) => {
+        onExit = listener
+      },
+    })
+    dependencies.probeMcp = () => {
+      probeStarted.resolve()
+      return probeResult.promise
+    }
+
+    const bridge = new PlaywrightBridge(dependencies)
+    const starting = bridge.start()
+    await probeStarted.promise
+    onExit!(1)
+    probeResult.resolve({ mcp: true, extension: true })
+
+    expect((await starting).state).toBe("failed")
+    expect(bridge.status().state).toBe("failed")
+  })
+
+  test("stop during start cannot be overwritten by the late probe result", async () => {
+    const dependencies = fakeDependencies()
+    const probeStarted = deferred<void>()
+    const probeResult = deferred<{ mcp: boolean; extension: boolean }>()
+    dependencies.probeMcp = () => {
+      probeStarted.resolve()
+      return probeResult.promise
+    }
+
+    const bridge = new PlaywrightBridge(dependencies)
+    const starting = bridge.start()
+    await probeStarted.promise
+    await bridge.stop()
+    probeResult.resolve({ mcp: true, extension: true })
+
+    expect((await starting).state).toBe("stopped")
+    expect(bridge.status().state).toBe("stopped")
+  })
+
+  test(
+    "a pending readiness probe is bounded by the startup deadline",
+    async () => {
+      const dependencies = fakeDependencies()
+      dependencies.probeMcp = () => new Promise(() => undefined)
+
+      const status = await new PlaywrightBridge(dependencies, {
+        startupTimeoutMs: 1,
+        startupPollMs: 1,
+      }).start()
+
+      expect(status.state).toBe("failed")
+      expect(status.reason).toContain("timed out")
+    },
+    100,
+  )
+
+  test("a rejected termination preserves ownership for a successful retry", async () => {
+    const dependencies = fakeDependencies()
+    let attempts = 0
+    dependencies.killTree = async () => {
+      attempts++
+      if (attempts === 1) throw new Error("termination failed")
+    }
+
+    const bridge = new PlaywrightBridge(dependencies)
+    await bridge.start()
+
+    await expect(bridge.stop()).rejects.toThrow("termination failed")
+    expect(bridge.status().state).toBe("stopping")
+    expect(bridge.status().pid).toBe(4242)
+    expect(existsSync(ownerFile(dependencies))).toBe(true)
+
+    await bridge.stop()
+    expect(bridge.status().state).toBe("stopped")
+    expect(existsSync(ownerFile(dependencies))).toBe(false)
+  })
+
+  test("timeout cleanup failure returns a redacted failed status", async () => {
+    const dependencies = fakeDependencies()
+    dependencies.probeMcp = async () => ({ mcp: false, extension: false })
+    dependencies.killTree = async () => {
+      throw new Error("SYNTHETIC_SECRET_MARKER")
+    }
+
+    const bridge = new PlaywrightBridge(dependencies, {
+      startupTimeoutMs: 1,
+      startupPollMs: 1,
+    })
+    const status = await bridge.start()
+
+    expect(status.state).toBe("failed")
+    expect(status.pid).toBe(4242)
+    expect(status.reason).not.toContain("SYNTHETIC_SECRET_MARKER")
+
+    dependencies.killTree = async () => undefined
+    await bridge.stop()
+  })
+
+  test("a bridge that did not acquire the lock cannot remove another bridge's record", async () => {
+    const dependencies = fakeDependencies()
+    const owner = new PlaywrightBridge(dependencies)
+    const contender = new PlaywrightBridge(dependencies)
+    await owner.start()
+
+    const contenderStatus = await contender.start()
+    expect(contenderStatus.state).toBe("failed")
+    expect(contenderStatus.reason).toBe("Playwright owner lock is already held")
+    await contender.stop()
+
+    expect(existsSync(ownerFile(dependencies))).toBe(true)
+    await owner.stop()
+  })
+
+  test("recovers a stale owner record when both PIDs and ports are inactive", async () => {
+    const dependencies = fakeDependencies()
+    dependencies.isProcessRunning = () => false
+    writeFileSync(
+      ownerFile(dependencies),
+      JSON.stringify({ ownerPid: 99101, mcpPid: 99102, startedAt: "2026-09-22T00:00:00.000Z" }),
+      "utf8",
+    )
+
+    const status = await new PlaywrightBridge(dependencies).start()
+
+    expect(status.state).toBe("ready")
+    expect(status.pid).toBe(4242)
+  })
+
+  test("does not recover a stale-looking record while either bridge port is occupied", async () => {
+    const dependencies = fakeDependencies()
+    dependencies.isProcessRunning = () => false
+    dependencies.isPortOpen = async (_host, port) => port === 8931
+    writeFileSync(
+      ownerFile(dependencies),
+      JSON.stringify({ ownerPid: 99201, mcpPid: 99202, startedAt: "2026-09-22T00:00:00.000Z" }),
+      "utf8",
+    )
+
+    const status = await new PlaywrightBridge(dependencies).start()
+
+    expect(status.state).toBe("failed")
+    expect(status.reason).toBe("foreign-owned port is already listening")
+    expect(existsSync(ownerFile(dependencies))).toBe(true)
+  })
+
+  test("dependency failures use controlled public diagnostics", async () => {
+    const dependencies = fakeDependencies()
+    dependencies.resolve = () => {
+      throw new Error("SYNTHETIC_SECRET_MARKER")
+    }
+
+    const status = await new PlaywrightBridge(dependencies).start()
+
+    expect(status.state).toBe("failed")
+    expect(status.reason).not.toContain("SYNTHETIC_SECRET_MARKER")
+  })
+
+  test("restarting an already-owned child preserves patch verification", async () => {
+    const dependencies = fakeDependencies()
+    let portOpen = false
+    dependencies.isPortOpen = async () => portOpen
+    const bridge = new PlaywrightBridge(dependencies)
+    expect((await bridge.start()).patchApplied).toBe(true)
+
+    portOpen = true
+    const status = await bridge.start()
+
+    expect(status.state).toBe("ready")
+    expect(status.patchApplied).toBe(true)
+    await bridge.stop()
+  })
+
+  test("the Windows adapter registers the ready bridge and cleans up in order", async () => {
+    const dependencies = fakeDependencies()
+    const calls: string[] = []
+    dependencies.startProxy = () => ({
+      url: new URL("http://127.0.0.1:8932/mcp"),
+      stop: () => calls.push("proxy.stop"),
+    })
+    dependencies.killTree = async (pid) => calls.push(`child.kill:${pid}`)
+
+    const servers = new Map<string, Record<string, unknown>>()
+    const removedTools: string[] = []
+    type Invocation = { sessionID: string; prompt: { text: string }; delivery: string }
+    type PromptCall = { sessionID: string; text: string; resume?: boolean }
+    const commands = new Map<string, { execute(input: Invocation): Promise<void> }>()
+    const synthetic: string[] = []
+    const prompts: PromptCall[] = []
+    const contextHooks: Array<(input: { system: Array<{ type: string; text: string }> }) => void> = []
+    const ctx = {
+      mcp: {
+        transform: async (callback: (editor: any) => void) => {
+          callback({
+            set: (name: string, config: Record<string, unknown>) => servers.set(name, config),
+            remove: (name: string) => {
+              calls.push(`mcp.remove:${name}`)
+              servers.delete(name)
+            },
+          })
+          return { dispose: async () => undefined }
+        },
+        reload: async () => calls.push("mcp.reload"),
+      },
+      tool: {
+        transform: async (callback: (editor: any) => void) => {
+          callback({ remove: (name: string) => removedTools.push(name) })
+          return { dispose: async () => undefined }
+        },
+        reload: async () => undefined,
+      },
+      command: {
+        transform: async (callback: (editor: any) => void) => {
+          callback({ add: (command: { name: string; execute(input: Invocation): Promise<void> }) => commands.set(command.name, command) })
+          return { dispose: async () => undefined }
+        },
+      },
+      session: {
+        synthetic: async ({ text }: { text: string }) => synthetic.push(text),
+        prompt: async (input: PromptCall) => prompts.push(input),
+        hook: async (_name: "context", callback: (input: { system: Array<{ type: string; text: string }> }) => void) => {
+          contextHooks.push(callback)
+          return { dispose: async () => undefined }
+        },
+      },
+    }
+
+    const bridge = new PlaywrightBridge(dependencies)
+    const cleanup = await installBridge(ctx as any, bridge)
+
+    expect(servers.get("playwright")).toEqual({
+      type: "remote",
+      url: "http://127.0.0.1:8931/mcp",
+      oauth: false,
+      disabled: false,
+    })
+    expect(removedTools).toEqual([
+      "playwright_browser_tabs",
+      "playwright_browser_run_code_unsafe",
+    ])
+    expect(commands.has("playwright-start")).toBe(true)
+    expect(commands.has("playwright-stop")).toBe(true)
+    expect(commands.has("playwright-restart")).toBe(true)
+    expect(commands.has("playwright-status")).toBe(true)
+    expect(commands.has("playwright-instructions")).toBe(true)
+
+    calls.splice(0)
+    await cleanup()
+    expect(calls).toEqual([
+      "mcp.reload",
+      "proxy.stop",
+      "child.kill:4242",
+    ])
+    expect(synthetic).toEqual([])
+    expect(prompts).toEqual([])
+  })
+
+  test("the WSL adapter registers the Windows proxy with its resolved bearer token", async () => {
+    const dependencies = fakeDependencies()
+    dependencies.platform = "linux"
+    dependencies.env = {
+      WSL_DISTRO_NAME: "Ubuntu",
+      OPENCODE_PLAYWRIGHT_WINDOWS_HOST: "172.20.0.1",
+    }
+    const servers = new Map<string, Record<string, unknown>>()
+    const removedTools: string[] = []
+    const ctx = {
+      mcp: {
+        transform: async (callback: (editor: any) => void) => {
+          callback({
+            set: (name: string, config: Record<string, unknown>) => servers.set(name, config),
+            remove: () => undefined,
+          })
+          return { dispose: async () => undefined }
+        },
+        reload: async () => undefined,
+      },
+      tool: {
+        transform: async (callback: (editor: any) => void) => {
+          callback({ remove: (name: string) => removedTools.push(name) })
+          return { dispose: async () => undefined }
+        },
+        reload: async () => undefined,
+      },
+      command: {
+        transform: async () => ({ dispose: async () => undefined }),
+      },
+      session: {
+        synthetic: async () => undefined,
+        hook: async () => ({ dispose: async () => undefined }),
+      },
+    }
+
+    await installBridge(ctx as any, new PlaywrightBridge(dependencies), "proxy-token-fixture")
+    const server = servers.get("playwright")!
+    expect(server).toMatchObject({
+      type: "remote",
+      url: "http://172.20.0.1:8932/mcp",
+      oauth: false,
+      disabled: false,
+       headers: { Authorization: "Bearer proxy-token-fixture" },
+     })
+    expect(removedTools).toEqual([
+      "playwright_browser_tabs",
+      "playwright_browser_run_code_unsafe",
+    ])
+  })
+
+  test("status distinguishes a configured proxy endpoint from a running proxy", async () => {
+    const dependencies = fakeDependencies()
+     dependencies.readText = (path) => path.endsWith("playwright-mcp-proxy-key")
+      ? "proxy-token\n"
+      : patchedBundle
+    const bridge = new PlaywrightBridge(dependencies)
+    expect((await bridge.start()).proxyRunning).toBe(true)
+    expect(bridge.status().proxyEndpoint?.href).toBe("http://127.0.0.1:8932/mcp")
+
+    await bridge.stop()
+
+    expect(bridge.status().proxyEndpoint?.href).toBe("http://127.0.0.1:8932/mcp")
+    expect(bridge.status().proxyRunning).toBe(false)
+  })
+
+  test("Windows lifecycle commands execute and use registration removal/reload paths", async () => {
+    const { bridge, lifecycle } = fakeAdapterBridge()
+    const fake = adapterContext()
+    const cleanup = await installBridge(fake.ctx as any, bridge)
+    fake.calls.splice(0)
+
+    await fake.commands.get("playwright-start")!.execute(commandInvocation())
+    await fake.commands.get("playwright-stop")!.execute(commandInvocation())
+    await fake.commands.get("playwright-restart")!.execute(commandInvocation())
+    await fake.commands.get("playwright-status")!.execute(commandInvocation())
+
+    expect(lifecycle).toEqual(["start", "start", "stop", "restart"])
+    expect(fake.calls).toEqual([
+      "mcp.reload",
+      "mcp.reload",
+      "mcp.reload",
+    ])
+    expect(fake.synthetic).toEqual([])
+    expect(fake.prompts).toHaveLength(4)
+    expect(fake.prompts.every(({ sessionID, resume }) => sessionID === "session" && resume === false)).toBe(true)
+    expect(fake.prompts[3].text).toBe([
+      "Playwright bridge",
+      "Platform: Windows",
+      "Mode: windows-owner",
+      "State: ready",
+      "Endpoint: http://127.0.0.1:8931/mcp",
+      "PID: 4242",
+      "Patch applied: yes",
+      "Proxy: http://127.0.0.1:8932/mcp",
+      "Proxy state: running",
+      "Extension: connected",
+      "Reason: none",
+    ].join("\n"))
+
+    await cleanup()
+    expect(fake.commandDisposed).toBe(1)
+    expect(fake.toolDisposed).toBe(1)
+  })
+
+  test("browser commands resume agent work and inject durable, non-duplicated tool guidance", async () => {
+    const { bridge } = fakeAdapterBridge()
+    const fake = adapterContext()
+    const cleanup = await installBridge(fake.ctx as any, bridge)
+
+    expect(fake.commands.has("playwright-current")).toBe(true)
+    expect(fake.commands.has("playwright")).toBe(true)
+    await fake.commands.get("playwright-current")!.execute(commandInvocation("Describe the visible dialog"))
+    expect(fake.prompts[0].sessionID).toBe("session")
+    expect(fake.prompts[0].text).toEqual(expect.stringContaining("browser_snapshot"))
+    expect(fake.prompts[0].text).toEqual(expect.stringContaining("Describe the visible dialog"))
+    expect(fake.prompts[0].text).toEqual(expect.stringContaining("Do not navigate"))
+    expect(fake.prompts[0].resume).toBeUndefined()
+
+    const exactContext = "Compare the visible offers\nKeep every detail in mind; do not omit caveats."
+    await fake.commands.get("playwright")!.execute(
+      commandInvocation(`https://example.com/a?q=one ${exactContext}`),
+    )
+    expect(fake.prompts[1].text).toEqual(expect.stringContaining("browser_navigate to exactly this URL: https://example.com/a?q=one"))
+    expect(fake.prompts[1].text).toEqual(expect.stringContaining(`Request context:\n${exactContext}`))
+    expect(fake.prompts[1].resume).toBeUndefined()
+
+    await fake.commands.get("playwright-current")!.execute(commandInvocation())
+    expect(fake.prompts[2].text).toEqual(expect.stringContaining("Summarize the current page"))
+    expect(fake.prompts[2].resume).toBeUndefined()
+
+    for (const text of ["", "ftp://example.com", "javascript:alert(1)", "not-a-url"]) {
+      const before = fake.prompts.length
+      await fake.commands.get("playwright")!.execute(commandInvocation(text))
+      expect(fake.prompts).toHaveLength(before + 1)
+      expect(fake.prompts.at(-1)).toEqual({
+        sessionID: "session",
+        text: "Usage: /playwright <http(s) URL> [context]",
+        resume: false,
+      })
+    }
+
+    const system: Array<{ type: string; text: string }> = []
+    fake.contextHooks.forEach((hook) => hook({ system }))
+    fake.contextHooks.forEach((hook) => hook({ system }))
+    expect(system).toHaveLength(1)
+    expect(system[0].text).toEqual(expect.stringContaining("GitHub MCP is the first choice"))
+    expect(system[0].text).toEqual(expect.stringContaining("webfetch/Jina returns 403"))
+    expect(system[0].text).toEqual(expect.stringContaining("Do not attempt to bypass"))
+
+    await cleanup()
+  })
+
+  test("startup diagnostics log only failures and distinguish the proxy token file", async () => {
+    const failedStatus: BridgeStatus = {
+      ...adapterStatus("failed"),
+      reason: "Playwright proxy token file is missing",
+    }
+    const failedBridge = {
+      status: () => failedStatus,
+      start: async () => failedStatus,
+      stop: async () => undefined,
+      detach: async () => undefined,
+      restart: async () => failedStatus,
+    } as unknown as PlaywrightBridge
+    const failureMessages: string[] = []
+    const failedCleanup = await installBridge(
+      adapterContext().ctx as any,
+      failedBridge,
+      undefined,
+      (message) => failureMessages.push(message),
+    )
+
+    expect(failureMessages).toEqual([
+      "Bridge startup failed (mode=windows-owner): default proxy token file is missing",
+    ])
+    expect(failureMessages.join("\n")).not.toContain("SECRET_MARKER")
+    await failedCleanup()
+
+    const { bridge } = fakeAdapterBridge()
+    const successMessages: string[] = []
+    const successCleanup = await installBridge(
+      adapterContext().ctx as any,
+      bridge,
+      undefined,
+      (message) => successMessages.push(message),
+    )
+    expect(successMessages).toEqual([])
+    await successCleanup()
+  })
+
+  test("instructions are registered on failed startup and give safe WSL setup steps", async () => {
+    const failed = adapterStatus("failed", "wsl-client")
+    failed.reason = "Windows Playwright proxy probe failed"
+    const { bridge } = fakeAdapterBridge(failed)
+    const fake = adapterContext()
+    const cleanup = await installBridge(fake.ctx as any, bridge, undefined, undefined, {
+      configDir: "/home/user/.config/opencode",
+      extensionTokenFile: "/home/user/.config/opencode/.secrets/playwright-key",
+      proxyTokenFile: "/home/user/.config/opencode/.secrets/playwright-mcp-proxy-key",
+      customProxyTokenPath: false,
+      logPath: "/home/user/.local/share/opencode/log/opencode-playwright-bridge.log",
+    })
+
+    expect(fake.commands.has("playwright-instructions")).toBe(true)
+    await fake.commands.get("playwright-instructions")!.execute(commandInvocation())
+    const instructions = fake.prompts[0].text
+    expect(instructions).toBe([
+      "Playwright setup and next steps",
+      "Current state: wsl-client / failed",
+      "Reason: proxy token=[redacted]",
+      "The extension key belongs on Windows, not in WSL.",
+      "Alternatively, set OPENCODE_PLAYWRIGHT_EXTENSION_TOKEN on the Windows OpenCode service and restart it.",
+      "Proxy key file: /home/user/.config/opencode/.secrets/playwright-mcp-proxy-key",
+      "Start OpenCode on Windows once; it automatically creates the default playwright-mcp-proxy-key if missing.",
+      "Copy the Windows proxy key securely into the WSL OpenCode config, then restart WSL OpenCode.",
+      'WIN_USER="$(cmd.exe /c echo %USERNAME% | tr -d \'\\r\')"',
+      'install -D -m 600 "/mnt/c/Users/$WIN_USER/.config/opencode/.secrets/playwright-mcp-proxy-key" "$HOME/.config/opencode/.secrets/playwright-mcp-proxy-key"',
+      "Adjust the source/destination paths if either OpenCode config directory is customized.",
+      "Diagnostics log (errors only): /home/user/.local/share/opencode/log/opencode-playwright-bridge.log",
+    ].join("\n"))
+    expect(instructions).toContain("Current state: wsl-client / failed")
+    expect(instructions).toContain("The extension key belongs on Windows, not in WSL")
+    expect(instructions).toContain("OPENCODE_PLAYWRIGHT_EXTENSION_TOKEN")
+    expect(instructions).toContain("Copy the Windows proxy key securely")
+    expect(instructions).toContain("install -D -m 600")
+    expect(instructions).toContain("restart WSL OpenCode")
+    expect(instructions).toContain("opencode-playwright-bridge.log")
+    expect(instructions).not.toContain("SECRET_MARKER")
+    await cleanup()
+
+    const customFake = adapterContext()
+    const customStatus = adapterStatus("failed")
+    const { bridge: customBridge } = fakeAdapterBridge(customStatus)
+    const customCleanup = await installBridge(customFake.ctx as any, customBridge, undefined, undefined, {
+      configDir: "/home/user/.config/opencode",
+      extensionTokenFile: "/home/user/.config/opencode/.secrets/playwright-key",
+      proxyTokenFile: "/custom/secure-proxy-key",
+      customProxyTokenPath: true,
+      logPath: "/home/user/.local/share/opencode/log/opencode-playwright-bridge.log",
+    })
+    await customFake.commands.get("playwright-instructions")!.execute(commandInvocation())
+    expect(customFake.prompts[0].text).toContain("A custom proxy token file is configured (/custom/secure-proxy-key)")
+    expect(customFake.prompts[0].text).toContain("never auto-generated")
+    expect(customFake.prompts[0].text).not.toContain("SECRET_MARKER")
+    expect(customFake.synthetic).toEqual([])
+    await customCleanup()
+  })
+
+  test("WSL lifecycle commands control the Windows owner and report status", async () => {
+    const { bridge, lifecycle } = fakeAdapterBridge(adapterStatus("ready", "wsl-client"))
+    const fake = adapterContext()
+    const cleanup = await installBridge(fake.ctx as any, bridge)
+    lifecycle.splice(0)
+    fake.synthetic.length = 0
+    fake.prompts.length = 0
+
+    await fake.commands.get("playwright-start")!.execute(commandInvocation())
+    await fake.commands.get("playwright-stop")!.execute(commandInvocation())
+    await fake.commands.get("playwright-restart")!.execute(commandInvocation())
+
+    expect(lifecycle).toEqual(["start", "stop", "restart"])
+    expect(fake.prompts).toHaveLength(3)
+    expect(fake.prompts[0].text).toContain("State: ready")
+    expect(fake.prompts[1].text).toContain("State: stopped")
+    expect(fake.prompts[2].text).toContain("State: ready")
+    expect(fake.synthetic).toEqual([])
+    await cleanup()
+  })
+
+  test.each(["degraded", "failed"] as const)(
+    "degraded/failed bridge status keeps registration and redacts operational status (%s)",
+    async (state) => {
+      const { bridge } = fakeAdapterBridge(adapterStatus(state))
+      const fake = adapterContext()
+      const cleanup = await installBridge(fake.ctx as any, bridge)
+
+      expect(fake.servers.has("playwright")).toBe(true)
+      await fake.commands.get("playwright-status")!.execute(commandInvocation())
+      expect(fake.prompts[0].text).toContain(`State: ${state}`)
+      expect(fake.prompts[0].text).toContain("Proxy: http://127.0.0.1:8932/mcp")
+      expect(fake.prompts[0].text).not.toContain("SECRET_MARKER")
+      expect(fake.prompts[0]).toMatchObject({ sessionID: "session", resume: false })
+      expect(fake.synthetic).toEqual([])
+      await cleanup()
+    },
+  )
+
+  test("shared setup cleanup is idempotent and stops only after the final release", async () => {
+    const { bridge, lifecycle } = fakeAdapterBridge()
+    const first = adapterContext()
+    const second = adapterContext()
+    const cleanupFirst = await installBridge(first.ctx as any, bridge)
+    const cleanupSecond = await installBridge(second.ctx as any, bridge)
+    lifecycle.splice(0)
+
+    await cleanupFirst()
+    await cleanupFirst()
+    expect(lifecycle).toEqual([])
+
+    await cleanupSecond()
+    await cleanupSecond()
+    expect(lifecycle).toEqual(["stop"])
+  })
+
+  test.each([
+    ["registration", { failMcpReload: true }],
+    ["tool", { failToolTransform: true }],
+    ["command", { failCommandTransform: true }],
+  ] as const)("setup failure after bridge start shuts down the bridge (%s)", async (_label, options) => {
+    const { bridge, lifecycle } = fakeAdapterBridge()
+    const fake = adapterContext(options)
+
+    await expect(installBridge(fake.ctx as any, bridge)).rejects.toThrow()
+    expect(lifecycle).toContain("stop")
+  })
+
+  test("cleanup stops the bridge when registration removal fails and propagates the failure", async () => {
+    const { bridge, lifecycle } = fakeAdapterBridge()
+    const fake = adapterContext()
+    const cleanup = await installBridge(fake.ctx as any, bridge)
+    fake.ctx.mcp.reload = async () => { throw new Error("registration removal failed") }
+
+    await expect(cleanup()).rejects.toThrow("registration removal failed")
+    expect(lifecycle).toContain("stop")
+    await cleanup()
+  })
+})

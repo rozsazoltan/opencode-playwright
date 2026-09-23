@@ -1,0 +1,32 @@
+{
+  "name": "opencode-playwright",
+  "version": "0.1.0",
+  "description": "OpenCode Playwright integration with a Windows owner bridge and WSL proxy",
+  "type": "module",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test tests"
+  },
+  "files": [
+    "src",
+    "scripts",
+    "patches",
+    "LICENSE",
+    "README.md",
+    "package.json"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rozsazoltan/opencode-playwright.git"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@opencode/plugin": "2.0.4",
+    "@playwright/mcp": "0.0.82",
+    "playwright": "1.64.0-alpha-1789764292000",
+    "playwright-core": "1.64.0-alpha-1789764292000"
+  }
+}
