@@ -303,23 +303,39 @@ export class PlaywrightBridge {
     let extensionToken: string
     try {
       resolvedMcpCli = this.validateWindowsPrerequisites()
-      extensionToken =
-        this.dependencies.env.OPENCODE_PLAYWRIGHT_EXTENSION_TOKEN?.trim() ??
-        this.dependencies.readText(this.config.extensionTokenFile).trim()
+      const environmentToken = this.dependencies.env.OPENCODE_PLAYWRIGHT_EXTENSION_TOKEN
+      if (environmentToken === undefined) {
+        try {
+          extensionToken = this.dependencies.readText(this.config.extensionTokenFile).trim()
+        } catch {
+          throw new Error("Playwright extension token file could not be read")
+        }
+      } else {
+        extensionToken = environmentToken.trim()
+      }
       if (extensionToken.length === 0) throw new Error("Playwright extension token is empty")
     } catch (error) {
       const safeReasons = [
+        "Playwright MCP package could not be resolved",
         "Playwright MCP entrypoint is missing",
+        "Playwright MCP entrypoint could not be checked",
+        "Playwright core bundle could not be resolved",
         "Playwright core bundle is missing",
+        "Playwright core bundle could not be checked",
+        "Playwright core bundle could not be read",
         "Playwright background-tab patch is missing",
         "Brave executable is missing",
+        "Brave executable could not be checked",
         "Playwright extension token file is missing",
+        "Playwright extension token file could not be checked",
+        "Playwright extension token file could not be read",
         "Playwright proxy token file is missing",
+        "Playwright proxy token file could not be checked",
         "Playwright extension token is empty",
       ]
       const reason = error instanceof Error && safeReasons.includes(error.message)
         ? error.message
-        : "Playwright prerequisites validation failed"
+        : "Playwright prerequisite check failed unexpectedly"
       return this.setStatus("failed", reason)
     }
     try {
@@ -459,31 +475,74 @@ export class PlaywrightBridge {
   }
 
   private validateWindowsPrerequisites(): string {
-    const packagePath = this.dependencies.resolve("@playwright/mcp/package.json")
+    let packagePath: string
+    try {
+      packagePath = this.dependencies.resolve("@playwright/mcp/package.json")
+    } catch {
+      throw new Error("Playwright MCP package could not be resolved")
+    }
     const resolvedMcpCli = join(dirname(packagePath), "cli.js")
-    if (!this.dependencies.fileExists(resolvedMcpCli)) {
+    let cliExists: boolean
+    try {
+      cliExists = this.dependencies.fileExists(resolvedMcpCli)
+    } catch {
+      throw new Error("Playwright MCP entrypoint could not be checked")
+    }
+    if (!cliExists) {
       throw new Error("Playwright MCP entrypoint is missing")
     }
 
-    const coreBundle = this.dependencies.resolve("playwright-core/lib/coreBundle")
-    if (!this.dependencies.fileExists(coreBundle)) {
+    let coreBundle: string
+    try {
+      coreBundle = this.dependencies.resolve("playwright-core/lib/coreBundle")
+    } catch {
+      throw new Error("Playwright core bundle could not be resolved")
+    }
+    let coreBundleExists: boolean
+    try {
+      coreBundleExists = this.dependencies.fileExists(coreBundle)
+    } catch {
+      throw new Error("Playwright core bundle could not be checked")
+    }
+    if (!coreBundleExists) {
       throw new Error("Playwright core bundle is missing")
     }
-    if (!hasBackgroundTabPatch(this.dependencies.readText(coreBundle))) {
+    let coreBundleText: string
+    try {
+      coreBundleText = this.dependencies.readText(coreBundle)
+    } catch {
+      throw new Error("Playwright core bundle could not be read")
+    }
+    if (!hasBackgroundTabPatch(coreBundleText)) {
       throw new Error("Playwright background-tab patch is missing")
     }
     this.patchVerified = true
 
-    if (!this.dependencies.fileExists(this.config.browserExecutable)) {
+    let browserExists: boolean
+    try {
+      browserExists = this.dependencies.fileExists(this.config.browserExecutable)
+    } catch {
+      throw new Error("Brave executable could not be checked")
+    }
+    if (!browserExists) {
       throw new Error("Brave executable is missing")
     }
-    if (
-      this.dependencies.env.OPENCODE_PLAYWRIGHT_EXTENSION_TOKEN === undefined &&
-      !this.dependencies.fileExists(this.config.extensionTokenFile)
-    ) {
-      throw new Error("Playwright extension token file is missing")
+    if (this.dependencies.env.OPENCODE_PLAYWRIGHT_EXTENSION_TOKEN === undefined) {
+      let extensionTokenExists: boolean
+      try {
+        extensionTokenExists = this.dependencies.fileExists(this.config.extensionTokenFile)
+      } catch {
+        throw new Error("Playwright extension token file could not be checked")
+      }
+      if (!extensionTokenExists) throw new Error("Playwright extension token file is missing")
     }
-    if (!this.dependencies.fileExists(this.config.proxyTokenFile)) {
+    let proxyTokenExists: boolean
+    try {
+      proxyTokenExists = this.dependencies.fileExists(this.config.proxyTokenFile)
+    } catch {
+      throw new Error("Playwright proxy token file could not be checked")
+    }
+    if (!proxyTokenExists) {
       throw new Error("Playwright proxy token file is missing")
     }
 

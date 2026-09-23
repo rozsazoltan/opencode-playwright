@@ -451,6 +451,69 @@ describe("PlaywrightBridge", () => {
     })
   })
 
+  test("Windows reports safe diagnostics for prerequisite operation failures", async () => {
+    const scenarios: Array<{
+      expected: string
+      fail(dependencies: BridgeDependencies): void
+    }> = [
+      {
+        expected: "Playwright MCP package could not be resolved",
+        fail: (dependencies) => {
+          dependencies.resolve = () => {
+            throw new Error("C:\\private\\user\\node_modules\\package.json")
+          }
+        },
+      },
+      {
+        expected: "Playwright prerequisite check failed unexpectedly",
+        fail: (dependencies) => {
+          dependencies.resolve = () => undefined as unknown as string
+        },
+      },
+      {
+        expected: "Playwright core bundle could not be resolved",
+        fail: (dependencies) => {
+          dependencies.resolve = (specifier) => {
+            if (specifier === "playwright-core/lib/coreBundle") {
+              throw new Error("C:\\private\\user\\node_modules\\coreBundle.js")
+            }
+            return specifier
+          }
+        },
+      },
+      {
+        expected: "Playwright core bundle could not be read",
+        fail: (dependencies) => {
+          dependencies.readText = (path) => {
+            if (path === "playwright-core/lib/coreBundle") throw new Error("permission denied")
+            return "token"
+          }
+        },
+      },
+      {
+        expected: "Playwright extension token file could not be read",
+        fail: (dependencies) => {
+          dependencies.readText = (path) => {
+            if (path === "playwright-core/lib/coreBundle") {
+              return 'async createTarget(url3) { this._sendToExtension("chrome.tabs.create", [{ url: url3, active: false }]) }'
+            }
+            throw new Error("C:\\private\\secrets\\playwright-key")
+          }
+        },
+      },
+    ]
+
+    for (const scenario of scenarios) {
+      const dependencies = fakeDependencies()
+      scenario.fail(dependencies)
+
+      const status = await new PlaywrightBridge(dependencies).start()
+
+      expect(status).toMatchObject({ state: "failed", reason: scenario.expected })
+      expect(status.reason).not.toContain("private")
+    }
+  })
+
   test("Windows starts the authenticated proxy only after loopback MCP readiness", async () => {
     const dependencies = fakeDependencies()
     const events: string[] = []
