@@ -18,6 +18,20 @@ import type { ProxyOptions, StartedProxy } from "../src/proxy"
 
 const temporaryDirectories = new Set<string>()
 const nativeFetch = globalThis.fetch
+const patchableBundle = `async createTarget(url3) {
+        const tab2 = await this._sendToExtension("chrome.tabs.create", [{ url: url3 }]);
+        await tab2.page.bringToFront();
+        await tab2.updateWebMCPTools();
+        await context.startRecording();
+        await tab2.page.bringToFront();
+        response2.addTextResult`
+const patchedBundle = `async createTarget(url3) {
+        const tab2 = await this._sendToExtension("chrome.tabs.create", [{ url: url3, active: false }]);
+        // MCP page activation intentionally suppressed.
+        await tab2.updateWebMCPTools();
+        await context.startRecording();
+        // MCP page activation intentionally suppressed.
+        response2.addTextResult`
 
 afterEach(() => {
   globalThis.fetch = nativeFetch
@@ -33,7 +47,7 @@ function fakeDependencies(): BridgeDependencies {
     platform: "win32",
     env: { OPENCODE_CONFIG_DIR: configDir },
     fileExists: () => true,
-    readText: () => 'async createTarget(url3) { this._sendToExtension("chrome.tabs.create", [{ url: url3, active: false }]) }',
+    readText: () => patchedBundle,
     writeText: () => undefined,
     resolve: (name) => name,
     isPortOpen: async () => false,
@@ -81,12 +95,15 @@ function adapterContext(options: {
   failToolTransform?: boolean
   failCommandTransform?: boolean
 } = {}) {
+  type Invocation = { sessionID: string; prompt: { text: string }; delivery: string }
+  type PromptCall = { sessionID: string; text: string; resume?: boolean }
   const calls: string[] = []
   const servers = new Map<string, Record<string, unknown>>()
   const removedTools: string[] = []
-  const commands = new Map<string, { execute(input: { sessionID: string }): Promise<void> }>()
+  const commands = new Map<string, { execute(input: Invocation): Promise<void> }>()
   const synthetic: string[] = []
-  const prompts: Array<{ sessionID: string; text: string; resume: false }> = []
+  const prompts: PromptCall[] = []
+  const contextHooks: Array<(input: { system: Array<{ type: string; text: string }> }) => void> = []
   let toolDisposed = 0
   let commandDisposed = 0
   const ctx = {
@@ -117,16 +134,24 @@ function adapterContext(options: {
     command: {
       transform: async (callback: (editor: any) => void) => {
         if (options.failCommandTransform) throw new Error("command transform failed")
-        callback({ add: (command: { name: string; execute(input: { sessionID: string }): Promise<void> }) => commands.set(command.name, command) })
+        callback({ add: (command: { name: string; execute(input: Invocation): Promise<void> }) => commands.set(command.name, command) })
         return { dispose: async () => { commandDisposed++ } }
       },
     },
     session: {
       synthetic: async ({ text }: { text: string }) => synthetic.push(text),
-      prompt: async (input: { sessionID: string; text: string; resume: false }) => prompts.push(input),
+      prompt: async (input: PromptCall) => prompts.push(input),
+      hook: async (_name: "context", callback: (input: { system: Array<{ type: string; text: string }> }) => void) => {
+        contextHooks.push(callback)
+        return { dispose: async () => undefined }
+      },
     },
   }
-  return { ctx, calls, servers, removedTools, commands, synthetic, prompts, get toolDisposed() { return toolDisposed }, get commandDisposed() { return commandDisposed } }
+  return { ctx, calls, servers, removedTools, commands, synthetic, prompts, contextHooks, get toolDisposed() { return toolDisposed }, get commandDisposed() { return commandDisposed } }
+}
+
+function commandInvocation(text = "") {
+  return { sessionID: "session", prompt: { text }, delivery: "inline" }
 }
 
 function fakeAdapterBridge(initialStatus = adapterStatus("ready")) {
@@ -421,7 +446,7 @@ describe("PlaywrightBridge", () => {
     dependencies.readText = (path) =>
       path.endsWith("playwright-key")
         ? "  extension-token-fixture  \n"
-        : 'async createTarget(url3) { this._sendToExtension("chrome.tabs.create", [{ url: url3, active: false }]) }'
+        : patchedBundle
     dependencies.spawn = (_command, _args, options) => {
       childEnvironment = options.env
       return { pid: 4242, onExit: () => undefined }
@@ -445,7 +470,7 @@ describe("PlaywrightBridge", () => {
     dependencies.fileExists = (path) => !path.endsWith("playwright-key")
     dependencies.readText = (path) => {
       if (path.endsWith("playwright-key")) throw new Error("token file must not be read")
-      return 'async createTarget(url3) { this._sendToExtension("chrome.tabs.create", [{ url: url3, active: false }]) }'
+      return patchedBundle
     }
     dependencies.spawn = (_command, _args, options) => {
       childEnvironment = options.env
@@ -487,7 +512,7 @@ describe("PlaywrightBridge", () => {
     dependencies.readText = (path) =>
       path.endsWith("playwright-key")
         ? " \n\t "
-        : 'async createTarget(url3) { this._sendToExtension("chrome.tabs.create", [{ url: url3, active: false }]) }'
+        : patchedBundle
     dependencies.spawn = () => {
       spawned = true
       throw new Error("must not spawn")
@@ -516,7 +541,7 @@ describe("PlaywrightBridge", () => {
 
   test("Windows patches the resolved plugin bundle before spawning and avoids rewriting patched bundles", async () => {
     const dependencies = fakeDependencies()
-    const bundle = 'async createTarget(url3) {\n        const tab2 = await this._sendToExtension("chrome.tabs.create", [{ url: url3 }]);'
+    const bundle = patchableBundle
     let bundleText = bundle
     const writes: Array<[string, string]> = []
     dependencies.resolve = (specifier) => specifier === "playwright-core/lib/coreBundle"
@@ -540,10 +565,33 @@ describe("PlaywrightBridge", () => {
     expect(writes).toHaveLength(1)
   })
 
+  test("Windows upgrades an older background-tab-only patch to suppress all MCP activation", async () => {
+    const dependencies = fakeDependencies()
+    const olderPatchedBundle = patchableBundle.replace(
+      'chrome.tabs.create", [{ url: url3 }]',
+      'chrome.tabs.create", [{ url: url3, active: false }]',
+    )
+    let bundleText = olderPatchedBundle
+    const writes: string[] = []
+    dependencies.readText = (path) => path.endsWith("coreBundle") ? bundleText : "token"
+    dependencies.writeText = (_path, value) => {
+      writes.push(value)
+      bundleText = value
+    }
+
+    const status = await new PlaywrightBridge(dependencies).start()
+
+    expect(status.state).toBe("ready")
+    expect(writes).toHaveLength(1)
+    expect(writes[0]).toContain("chrome.tabs.create\", [{ url: url3, active: false }]")
+    expect(writes[0]).not.toContain("bringToFront")
+    await new PlaywrightBridge(dependencies).stop()
+  })
+
   test("Windows reports safe filesystem codes when bundle patching fails without spawning", async () => {
     const dependencies = fakeDependencies()
     dependencies.readText = (path) => path === "playwright-core/lib/coreBundle"
-      ? 'async createTarget(url3) {\n        const tab2 = await this._sendToExtension("chrome.tabs.create", [{ url: url3 }]);'
+      ? patchableBundle
       : "token"
     dependencies.writeText = () => {
       throw Object.assign(
@@ -569,7 +617,7 @@ describe("PlaywrightBridge", () => {
   test("Windows reports allowlisted error names and codes while redacting unknown details", async () => {
     const dependencies = fakeDependencies()
     dependencies.readText = (path) => path === "playwright-core/lib/coreBundle"
-      ? 'async createTarget(url3) {\n        const tab2 = await this._sendToExtension("chrome.tabs.create", [{ url: url3 }]);'
+      ? patchableBundle
       : "token"
     dependencies.writeText = () => {
       throw Object.assign(new TypeError("C:\\private\\user\\secret details"), {
@@ -599,7 +647,7 @@ describe("PlaywrightBridge", () => {
   test("Windows redacts unrecognized bundle patch error names and codes", async () => {
     const dependencies = fakeDependencies()
     dependencies.readText = (path) => path === "playwright-core/lib/coreBundle"
-      ? 'async createTarget(url3) {\n        const tab2 = await this._sendToExtension("chrome.tabs.create", [{ url: url3 }]);'
+      ? patchableBundle
       : "token"
     dependencies.writeText = () => {
       throw Object.assign(new Error("private failure"), {
@@ -619,7 +667,7 @@ describe("PlaywrightBridge", () => {
   test("Windows identifies a missing bundle patch writer without spawning", async () => {
     const dependencies = fakeDependencies()
     dependencies.readText = (path) => path === "playwright-core/lib/coreBundle"
-      ? 'async createTarget(url3) {\n        const tab2 = await this._sendToExtension("chrome.tabs.create", [{ url: url3 }]);'
+      ? patchableBundle
       : "token"
     dependencies.writeText = undefined as unknown as BridgeDependencies["writeText"]
     let spawned = false
@@ -682,7 +730,7 @@ describe("PlaywrightBridge", () => {
           dependencies.readText = (path) => {
             if (path.endsWith("playwright-mcp-proxy-key")) return "generated-proxy-token"
             if (path === "playwright-core/lib/coreBundle") {
-              return 'async createTarget(url3) { this._sendToExtension("chrome.tabs.create", [{ url: url3, active: false }]) }'
+              return patchedBundle
             }
             if (path.endsWith("playwright-key")) throw new Error("C:\\private\\secrets\\playwright-key")
             return "unexpected"
@@ -710,7 +758,7 @@ describe("PlaywrightBridge", () => {
     let receivedBinding = false
     dependencies.readText = (path) => {
        if (path.endsWith("playwright-mcp-proxy-key")) return "proxy-token\n"
-      return 'async createTarget(url3) { this._sendToExtension("chrome.tabs.create", [{ url: url3, active: false }]) }'
+      return patchedBundle
     }
     dependencies.probeMcp = async () => {
       events.push("probe")
@@ -739,7 +787,7 @@ describe("PlaywrightBridge", () => {
     const dependencies = fakeDependencies()
     dependencies.readText = (path) => path.endsWith("playwright-mcp-proxy-key")
       ? "proxy-token\n"
-      : 'async createTarget(url3) { this._sendToExtension("chrome.tabs.create", [{ url: url3, active: false }]) }'
+      : patchedBundle
     dependencies.startProxy = () => {
       throw new Error("No WSL NAT client subnets could be detected")
     }
@@ -756,7 +804,7 @@ describe("PlaywrightBridge", () => {
     const dependencies = fakeDependencies()
     dependencies.readText = (path) => path.endsWith("playwright-mcp-proxy-key")
       ? "proxy-token\n"
-      : 'async createTarget(url3) { this._sendToExtension("chrome.tabs.create", [{ url: url3, active: false }]) }'
+      : patchedBundle
     dependencies.startProxy = () => {
       throw new Error("private operating system detail")
     }
@@ -875,7 +923,7 @@ describe("PlaywrightBridge", () => {
     dependencies.readText = (path) =>
       path.endsWith("playwright-mcp-proxy-key")
         ? "wsl-proxy-token-fixture\n"
-        : 'async createTarget(url3) { this._sendToExtension("chrome.tabs.create", [{ url: url3, active: false }]) }'
+        : patchedBundle
     dependencies.probeMcp = async (_endpoint, bearerToken) => {
       probeToken = bearerToken
       return { mcp: true, extension: true }
@@ -906,7 +954,7 @@ describe("PlaywrightBridge", () => {
       }
       if (path === "/etc/resolv.conf") return "nameserver 10.0.0.53\n"
       if (path.endsWith("playwright-mcp-proxy-key")) return "wsl-proxy-token-fixture\n"
-      return 'async createTarget(url3) { this._sendToExtension("chrome.tabs.create", [{ url: url3, active: false }]) }'
+      return patchedBundle
     }
     dependencies.probeMcp = async () => ({ mcp: true, extension: true })
 
@@ -924,7 +972,7 @@ describe("PlaywrightBridge", () => {
       if (path === "/proc/net/route") return "eth0 00000000 not-an-ip"
       if (path === "/etc/resolv.conf") return "nameserver 10.0.0.53\n"
       if (path.endsWith("playwright-mcp-proxy-key")) return "wsl-proxy-token-fixture\n"
-      return 'async createTarget(url3) { this._sendToExtension("chrome.tabs.create", [{ url: url3, active: false }]) }'
+      return patchedBundle
     }
     dependencies.probeMcp = async () => ({ mcp: true, extension: true })
 
@@ -940,7 +988,7 @@ describe("PlaywrightBridge", () => {
     dependencies.readText = (path) => {
       if (path === "/proc/net/route" || path === "/etc/resolv.conf") throw new Error("missing")
       if (path.endsWith("playwright-mcp-proxy-key")) return "wsl-proxy-token-fixture\n"
-      return 'async createTarget(url3) { this._sendToExtension("chrome.tabs.create", [{ url: url3, active: false }]) }'
+      return patchedBundle
     }
     dependencies.probeMcp = async () => ({ mcp: true, extension: true })
 
@@ -1203,9 +1251,12 @@ describe("PlaywrightBridge", () => {
 
     const servers = new Map<string, Record<string, unknown>>()
     const removedTools: string[] = []
-    const commands = new Map<string, { execute(input: { sessionID: string }): Promise<void> }>()
+    type Invocation = { sessionID: string; prompt: { text: string }; delivery: string }
+    type PromptCall = { sessionID: string; text: string; resume?: boolean }
+    const commands = new Map<string, { execute(input: Invocation): Promise<void> }>()
     const synthetic: string[] = []
-    const prompts: Array<{ sessionID: string; text: string; resume: false }> = []
+    const prompts: PromptCall[] = []
+    const contextHooks: Array<(input: { system: Array<{ type: string; text: string }> }) => void> = []
     const ctx = {
       mcp: {
         transform: async (callback: (editor: any) => void) => {
@@ -1229,13 +1280,17 @@ describe("PlaywrightBridge", () => {
       },
       command: {
         transform: async (callback: (editor: any) => void) => {
-          callback({ add: (command: { name: string; execute(input: { sessionID: string }): Promise<void> }) => commands.set(command.name, command) })
+          callback({ add: (command: { name: string; execute(input: Invocation): Promise<void> }) => commands.set(command.name, command) })
           return { dispose: async () => undefined }
         },
       },
       session: {
         synthetic: async ({ text }: { text: string }) => synthetic.push(text),
-        prompt: async (input: { sessionID: string; text: string; resume: false }) => prompts.push(input),
+        prompt: async (input: PromptCall) => prompts.push(input),
+        hook: async (_name: "context", callback: (input: { system: Array<{ type: string; text: string }> }) => void) => {
+          contextHooks.push(callback)
+          return { dispose: async () => undefined }
+        },
       },
     }
 
@@ -1299,7 +1354,10 @@ describe("PlaywrightBridge", () => {
       command: {
         transform: async () => ({ dispose: async () => undefined }),
       },
-      session: { synthetic: async () => undefined },
+      session: {
+        synthetic: async () => undefined,
+        hook: async () => ({ dispose: async () => undefined }),
+      },
     }
 
     await installBridge(ctx as any, new PlaywrightBridge(dependencies), "proxy-token-fixture")
@@ -1321,7 +1379,7 @@ describe("PlaywrightBridge", () => {
     const dependencies = fakeDependencies()
      dependencies.readText = (path) => path.endsWith("playwright-mcp-proxy-key")
       ? "proxy-token\n"
-      : 'async createTarget(url3) { this._sendToExtension("chrome.tabs.create", [{ url: url3, active: false }]) }'
+      : patchedBundle
     const bridge = new PlaywrightBridge(dependencies)
     expect((await bridge.start()).proxyRunning).toBe(true)
     expect(bridge.status().proxyEndpoint?.href).toBe("http://127.0.0.1:8932/mcp")
@@ -1338,10 +1396,10 @@ describe("PlaywrightBridge", () => {
     const cleanup = await installBridge(fake.ctx as any, bridge)
     fake.calls.splice(0)
 
-    await fake.commands.get("playwright-start")!.execute({ sessionID: "session" })
-    await fake.commands.get("playwright-stop")!.execute({ sessionID: "session" })
-    await fake.commands.get("playwright-restart")!.execute({ sessionID: "session" })
-    await fake.commands.get("playwright-status")!.execute({ sessionID: "session" })
+    await fake.commands.get("playwright-start")!.execute(commandInvocation())
+    await fake.commands.get("playwright-stop")!.execute(commandInvocation())
+    await fake.commands.get("playwright-restart")!.execute(commandInvocation())
+    await fake.commands.get("playwright-status")!.execute(commandInvocation())
 
     expect(lifecycle).toEqual(["start", "start", "stop", "restart"])
     expect(fake.calls).toEqual([
@@ -1369,6 +1427,54 @@ describe("PlaywrightBridge", () => {
     await cleanup()
     expect(fake.commandDisposed).toBe(1)
     expect(fake.toolDisposed).toBe(1)
+  })
+
+  test("browser commands resume agent work and inject durable, non-duplicated tool guidance", async () => {
+    const { bridge } = fakeAdapterBridge()
+    const fake = adapterContext()
+    const cleanup = await installBridge(fake.ctx as any, bridge)
+
+    expect(fake.commands.has("playwright-current")).toBe(true)
+    expect(fake.commands.has("playwright")).toBe(true)
+    await fake.commands.get("playwright-current")!.execute(commandInvocation("Describe the visible dialog"))
+    expect(fake.prompts[0].sessionID).toBe("session")
+    expect(fake.prompts[0].text).toEqual(expect.stringContaining("browser_snapshot"))
+    expect(fake.prompts[0].text).toEqual(expect.stringContaining("Describe the visible dialog"))
+    expect(fake.prompts[0].text).toEqual(expect.stringContaining("Do not navigate"))
+    expect(fake.prompts[0].resume).toBeUndefined()
+
+    const exactContext = "Compare the visible offers\nKeep every detail in mind; do not omit caveats."
+    await fake.commands.get("playwright")!.execute(
+      commandInvocation(`https://example.com/a?q=one ${exactContext}`),
+    )
+    expect(fake.prompts[1].text).toEqual(expect.stringContaining("browser_navigate to exactly this URL: https://example.com/a?q=one"))
+    expect(fake.prompts[1].text).toEqual(expect.stringContaining(`Request context:\n${exactContext}`))
+    expect(fake.prompts[1].resume).toBeUndefined()
+
+    await fake.commands.get("playwright-current")!.execute(commandInvocation())
+    expect(fake.prompts[2].text).toEqual(expect.stringContaining("Summarize the current page"))
+    expect(fake.prompts[2].resume).toBeUndefined()
+
+    for (const text of ["", "ftp://example.com", "javascript:alert(1)", "not-a-url"]) {
+      const before = fake.prompts.length
+      await fake.commands.get("playwright")!.execute(commandInvocation(text))
+      expect(fake.prompts).toHaveLength(before + 1)
+      expect(fake.prompts.at(-1)).toEqual({
+        sessionID: "session",
+        text: "Usage: /playwright <http(s) URL> [context]",
+        resume: false,
+      })
+    }
+
+    const system: Array<{ type: string; text: string }> = []
+    fake.contextHooks.forEach((hook) => hook({ system }))
+    fake.contextHooks.forEach((hook) => hook({ system }))
+    expect(system).toHaveLength(1)
+    expect(system[0].text).toEqual(expect.stringContaining("GitHub MCP is the first choice"))
+    expect(system[0].text).toEqual(expect.stringContaining("webfetch/Jina returns 403"))
+    expect(system[0].text).toEqual(expect.stringContaining("Do not attempt to bypass"))
+
+    await cleanup()
   })
 
   test("startup diagnostics log only failures and distinguish the proxy token file", async () => {
@@ -1423,7 +1529,7 @@ describe("PlaywrightBridge", () => {
     })
 
     expect(fake.commands.has("playwright-instructions")).toBe(true)
-    await fake.commands.get("playwright-instructions")!.execute({ sessionID: "session" })
+    await fake.commands.get("playwright-instructions")!.execute(commandInvocation())
     const instructions = fake.prompts[0].text
     expect(instructions).toBe([
       "Playwright setup and next steps",
@@ -1459,7 +1565,7 @@ describe("PlaywrightBridge", () => {
       customProxyTokenPath: true,
       logPath: "/home/user/.local/share/opencode/log/opencode-playwright-bridge.log",
     })
-    await customFake.commands.get("playwright-instructions")!.execute({ sessionID: "session" })
+    await customFake.commands.get("playwright-instructions")!.execute(commandInvocation())
     expect(customFake.prompts[0].text).toContain("A custom proxy token file is configured (/custom/secure-proxy-key)")
     expect(customFake.prompts[0].text).toContain("never auto-generated")
     expect(customFake.prompts[0].text).not.toContain("SECRET_MARKER")
@@ -1475,9 +1581,9 @@ describe("PlaywrightBridge", () => {
     fake.synthetic.length = 0
     fake.prompts.length = 0
 
-    await fake.commands.get("playwright-start")!.execute({ sessionID: "session" })
-    await fake.commands.get("playwright-stop")!.execute({ sessionID: "session" })
-    await fake.commands.get("playwright-restart")!.execute({ sessionID: "session" })
+    await fake.commands.get("playwright-start")!.execute(commandInvocation())
+    await fake.commands.get("playwright-stop")!.execute(commandInvocation())
+    await fake.commands.get("playwright-restart")!.execute(commandInvocation())
 
     expect(lifecycle).toEqual(["start", "stop", "restart"])
     expect(fake.prompts).toHaveLength(3)
@@ -1496,7 +1602,7 @@ describe("PlaywrightBridge", () => {
       const cleanup = await installBridge(fake.ctx as any, bridge)
 
       expect(fake.servers.has("playwright")).toBe(true)
-      await fake.commands.get("playwright-status")!.execute({ sessionID: "session" })
+      await fake.commands.get("playwright-status")!.execute(commandInvocation())
       expect(fake.prompts[0].text).toContain(`State: ${state}`)
       expect(fake.prompts[0].text).toContain("Proxy: http://127.0.0.1:8932/mcp")
       expect(fake.prompts[0].text).not.toContain("SECRET_MARKER")

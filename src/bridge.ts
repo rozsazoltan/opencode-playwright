@@ -139,11 +139,9 @@ function playwrightArguments(config: BridgeConfig, mcpCli: string): string[] {
   ]
 }
 
-function hasBackgroundTabPatch(source: string): boolean {
-  const methodStart = source.indexOf("async createTarget(url3)")
-  if (methodStart < 0) return false
-  const method = source.slice(methodStart, methodStart + 2_000)
-  return method.includes('"chrome.tabs.create"') && method.includes("active: false")
+function hasFocusSuppressionPatch(source: string): boolean {
+  return source.includes('"chrome.tabs.create", [{ url: url3, active: false }]') &&
+    source.split("// MCP page activation intentionally suppressed.").length - 1 === 2
 }
 
 function wslGateway(dependencies: BridgeDependencies): string | undefined {
@@ -628,7 +626,7 @@ export class PlaywrightBridge {
       throw new Error("Playwright core bundle could not be read")
     }
     let patchedBundleText: string
-    if (hasBackgroundTabPatch(coreBundleText)) {
+    if (hasFocusSuppressionPatch(coreBundleText)) {
       patchedBundleText = coreBundleText
     } else {
       try {
@@ -647,8 +645,8 @@ export class PlaywrightBridge {
         }
       }
     }
-    if (!hasBackgroundTabPatch(patchedBundleText)) {
-      throw new Error("Playwright background-tab patch is missing")
+    if (!hasFocusSuppressionPatch(patchedBundleText)) {
+      throw new Error("Playwright focus-suppression patch is missing")
     }
     this.patchVerified = true
 

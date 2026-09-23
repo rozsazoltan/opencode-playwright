@@ -65,6 +65,24 @@ in OpenCode for current status and setup-specific next steps.
 without starting an agent response. The text is saved in the session history;
 it is not an assistant message.
 
+### Browser commands and tool choice
+
+- `/playwright-current [request]` asks the agent to inspect the currently selected
+  tab and answer the request; with no request, it summarizes the page. It does not
+  navigate.
+- `/playwright <http(s) URL> [context]` opens the URL in Playwright, then asks the
+  agent to inspect the page and fulfill the remaining context. For example:
+  `/playwright https://example.com/pricing Compare the plans and note any caveats`.
+  Both browser commands resume the agent; they instruct it to use the existing
+  Playwright MCP integration rather than invoking browser tools in the command handler.
+
+Prefer GitHub MCP for GitHub repositories, issues, pull requests, and releases.
+Prefer Jina/webfetch for quick static/public content and search. Use Playwright for
+JavaScript-rendered, interactive, authenticated/session-based content, visual or
+actual browser state, and when Jina/webfetch returns 403 or a bot/CAPTCHA challenge.
+Do not try to bypass a challenge: ask the user to complete it in their browser, then
+continue by inspecting the current Playwright page.
+
 ## Configuration environment variables
 
 All entries are optional unless noted. File paths may be absolute or relative to
@@ -127,9 +145,12 @@ the configured extension key; it is not the name of the user-facing override.
 
 Before starting the Windows owner, the bridge applies the version-pinned patch to its
 plugin-resolved `playwright-core` bundle. The extension creates new tabs with
-`active: false`, keeping the user's previously active tab focused. The patch is
-idempotent, and the bridge fails closed if the bundle is unavailable, unwritable, or
-does not have the expected shape. WSL clients do not modify a bundle.
+`active: false`, and the MCP `selectTab` and `browser_start_recording` handlers do not
+bring their selected page to the foreground. Internal current-tab selection and
+recording behavior remain unchanged. The patch is idempotent, and the bridge fails
+closed if the bundle is unavailable, unwritable, or does not have the expected shape.
+It does not intercept generic Playwright/CDP `Page.bringToFront`, DOM focus, or
+arbitrary CDP commands. WSL clients do not modify a bundle.
 
 The patch artifact under `patches/` is kept for review and reproducibility; the bridge
 applies the same narrowly scoped source change at runtime.

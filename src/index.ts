@@ -30,6 +30,40 @@ type PluginOptions = Readonly<Record<string, unknown>>
 type OwnerLifecycleRequester = (action: OwnerLifecycleAction) => Promise<void>
 type DiagnosticLogger = (message: string) => void
 
+const TOOL_SELECTION_GUIDANCE = [
+  "Tool selection guidance:",
+  "- GitHub MCP is the first choice for GitHub repositories, issues, pull requests, and releases.",
+  "- Jina/webfetch is the first choice for static/public quick content and search.",
+  "- Use Playwright for JavaScript-rendered, interactive, authenticated/session-based content, visual or actual browser state, and when webfetch/Jina returns 403 or a bot/CAPTCHA challenge.",
+  "- Do not attempt to bypass bot/CAPTCHA challenges. If user action is needed, ask the user to complete it in their browser, then continue from a Playwright snapshot/current page.",
+].join("\n")
+
+const PLAYWRIGHT_URL_USAGE = "Usage: /playwright <http(s) URL> [context]"
+
+function parseHttpUrl(value: string): URL | undefined {
+  try {
+    const url = new URL(value)
+    return url.protocol === "http:" || url.protocol === "https:" ? url : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function currentPagePrompt(request: string): string {
+  return [
+    "Use the existing Playwright MCP integration to inspect the currently selected browser tab with browser_snapshot (use browser_tabs only if needed), then answer the request below. Do not navigate.",
+    request.length > 0 ? `Request:\n${request}` : "Summarize the current page.",
+  ].join("\n\n")
+}
+
+function urlPrompt(url: string, context: string): string {
+  return [
+    `Use the existing Playwright MCP integration to navigate with browser_navigate to exactly this URL: ${url}`,
+    "Then inspect the browser_snapshot/current page and fulfill the entire request context below.",
+    context.length > 0 ? `Request context:\n${context}` : "Request context: inspect and summarize the page.",
+  ].join("\n\n")
+}
+
 export function diagnosticLogPath(
   env: NodeJS.ProcessEnv = process.env,
   homeDirectory: string = homedir(),
@@ -570,6 +604,7 @@ export async function installBridge(
   let mcpOperation = Promise.resolve()
   let toolRegistration: Awaited<ReturnType<PluginContext["tool"]["transform"]>> | undefined
   let commandRegistration: Awaited<ReturnType<PluginContext["command"]["transform"]>> | undefined
+  let sessionHookRegistration: Awaited<ReturnType<PluginContext["session"]["hook"]>> | undefined
   let retryTimer: ReturnType<typeof setInterval> | undefined
   let retryAttempts = 0
   let retryLimit: number | undefined
@@ -673,6 +708,14 @@ export async function installBridge(
     })
     await ctx.tool.reload()
 
+    if (typeof ctx.session.hook === "function") {
+      sessionHookRegistration = await ctx.session.hook("context", (input) => {
+        if (!input.system.some((part) => part.type === "text" && part.text === TOOL_SELECTION_GUIDANCE)) {
+          input.system.push({ type: "text", text: TOOL_SELECTION_GUIDANCE })
+        }
+      })
+    }
+
     commandRegistration = await ctx.command.transform((editor) => {
       editor.add({
         name: "playwright-start",
@@ -725,6 +768,31 @@ export async function installBridge(
           })
         },
       })
+      editor.add({
+        name: "playwright-current",
+        description: "Inspect the currently selected browser tab",
+        execute: async ({ sessionID, prompt }) => {
+          await ctx.session.prompt({
+            sessionID,
+            text: currentPagePrompt(prompt.text.trim()),
+          })
+        },
+      })
+      editor.add({
+        name: "playwright",
+        description: "Open a URL in Playwright and fulfill a request",
+        execute: async ({ sessionID, prompt }) => {
+          const trimmedPrompt = prompt.text.trim()
+          const rawUrl = trimmedPrompt.split(/\s+/, 1)[0] ?? ""
+          const url = parseHttpUrl(rawUrl)
+          if (url === undefined) {
+            await ctx.session.prompt({ sessionID, text: PLAYWRIGHT_URL_USAGE, resume: false })
+            return
+          }
+          const context = trimmedPrompt.slice(rawUrl.length).trim()
+          await ctx.session.prompt({ sessionID, text: urlPrompt(rawUrl, context) })
+        },
+      })
     })
 
     return async () => {
@@ -748,6 +816,11 @@ export async function installBridge(
         if (failure === undefined) failure = error
       }
       try {
+        await sessionHookRegistration?.dispose()
+      } catch (error) {
+        if (failure === undefined) failure = error
+      }
+      try {
         await toolRegistration!.dispose()
       } catch (error) {
         if (failure === undefined) failure = error
@@ -766,6 +839,11 @@ export async function installBridge(
     }
     try {
       if (commandRegistration !== undefined) await commandRegistration.dispose()
+    } catch {
+      // Preserve the setup failure.
+    }
+    try {
+      if (sessionHookRegistration !== undefined) await sessionHookRegistration.dispose()
     } catch {
       // Preserve the setup failure.
     }

@@ -8,3 +8,22 @@ diff --git a/lib/coreBundle.js b/lib/coreBundle.js
          if (tab2?.id === void 0)
            throw new Error("Failed to create tab");
          this._knownTabs.set(tab2.id, tab2);
+@@ -66300,9 +66300,9 @@
+       async selectTab(index) {
+         const tab2 = this._tabs[index];
+         if (!tab2)
+           throw new Error(`Tab ${index} not found`);
+-        await tab2.page.bringToFront();
++         // MCP page activation intentionally suppressed.
+         await tab2.updateWebMCPTools();
+         this._setCurrentTab(tab2);
+         return tab2;
+       }
+@@ -68434,6 +68434,6 @@
+       handle: async (context, params2, response2) => {
+         const tab2 = await context.ensureTab();
+         await context.startRecording();
+-        await tab2.page.bringToFront();
++         // MCP page activation intentionally suppressed.
+         response2.addTextResult(`Recording started. Call ${stopRecording.schema.name} to retrieve the recorded actions.`);
+       }

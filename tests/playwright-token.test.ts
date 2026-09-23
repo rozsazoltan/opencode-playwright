@@ -6,6 +6,13 @@ import { PlaywrightBridge, type BridgeDependencies } from "../src/bridge"
 import { bridgeConfigFromOptions } from "../src/index"
 
 const temporaryDirectories = new Set<string>()
+const patchedBundle = `async createTarget(url3) {
+        const tab2 = await this._sendToExtension("chrome.tabs.create", [{ url: url3, active: false }]);
+        // MCP page activation intentionally suppressed.
+        await tab2.updateWebMCPTools();
+        await context.startRecording();
+        // MCP page activation intentionally suppressed.
+        response2.addTextResult`
 
 afterEach(() => {
   for (const directory of temporaryDirectories) rmSync(directory, { force: true, recursive: true })
@@ -30,7 +37,7 @@ function fixture(options: {
         return readFileSync(path, "utf8")
       }
       if (path.endsWith("playwright-key")) return "extension-token"
-      return 'async createTarget(url3) { this._sendToExtension("chrome.tabs.create", [{ url: url3, active: false }]) }'
+      return patchedBundle
     },
     writeText: () => undefined,
     resolve: (name) => name,
@@ -137,7 +144,7 @@ describe("Windows default proxy token", () => {
     writeFileSync(defaultTokenPath, "sensitive-marker")
     dependencies.readText = (path) => {
       if (path === defaultTokenPath) throw new Error("sensitive-marker")
-      return 'async createTarget(url3) { this._sendToExtension("chrome.tabs.create", [{ url: url3, active: false }]) }'
+      return patchedBundle
     }
     const unreadable = await new PlaywrightBridge(dependencies).start()
     expect(unreadable.state).toBe("failed")
