@@ -61,6 +61,10 @@ If your Windows profile is not under `/mnt/c/Users`, adjust the source path to i
 mounted location. Never display or paste either token value. Run `/playwright-instructions`
 in OpenCode for current status and setup-specific next steps.
 
+`/playwright-status` and `/playwright-instructions` post fixed-format user messages
+without starting an agent response. The text is saved in the session history;
+it is not an assistant message.
+
 ## Configuration environment variables
 
 All entries are optional unless noted. File paths may be absolute or relative to

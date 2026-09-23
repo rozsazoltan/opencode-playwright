@@ -338,19 +338,28 @@ export function createBridge(options: PluginOptions = {}): PlaywrightBridge {
     }
   })()
   const portOpen = async (host: string, port: number): Promise<boolean> => {
-    const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), 500)
-    try {
-      const response = await fetch(`http://${host}:${port}`, {
-        method: "HEAD",
-        signal: controller.signal,
-      })
-      return response.status > 0
-    } catch {
-      return false
-    } finally {
-      clearTimeout(timeout)
+    const probe = async (address: string): Promise<boolean> => {
+      const controller = new AbortController()
+      const timeout = setTimeout(() => controller.abort(), 500)
+      const formattedAddress = address.includes(":") ? `[${address}]` : address
+      try {
+        const response = await fetch(`http://${formattedAddress}:${port}`, {
+          method: "HEAD",
+          signal: controller.signal,
+        })
+        return response.status > 0
+      } catch {
+        return false
+      } finally {
+        clearTimeout(timeout)
+      }
     }
+
+    if (await probe(host)) return true
+    // Windows can bind the MCP server to IPv6 loopback only, while the bridge
+    // ownership check intentionally starts with its IPv4 loopback address.
+    if (host === "127.0.0.1" || host === "localhost") return probe("::1")
+    return false
   }
 
   const dependencies: BridgeDependencies = {
@@ -510,7 +519,7 @@ function needsOwnerStartupRetry(status: BridgeStatus): boolean {
 }
 
 async function emitStatus(ctx: PluginContext, sessionID: string, status: BridgeStatus): Promise<void> {
-  await ctx.session.synthetic({ sessionID, text: statusText(status) })
+  await ctx.session.prompt({ sessionID, text: statusText(status), resume: false })
 }
 
 async function startBridge(bridge: PlaywrightBridge): Promise<BridgeStatus> {
@@ -544,7 +553,7 @@ function retainBridge(bridge: PlaywrightBridge): () => Promise<void> {
     references.count--
     if (references.count > 0) return
     bridgeReferences.delete(bridge)
-    await bridge.stop()
+    await bridge.detach()
   }
 }
 
@@ -709,9 +718,10 @@ export async function installBridge(
         name: "playwright-instructions",
         description: "Show Playwright setup and next steps",
         execute: async ({ sessionID }) => {
-          await ctx.session.synthetic({
+          await ctx.session.prompt({
             sessionID,
             text: playwrightInstructions(bridge.status(), instructionDetails),
+            resume: false,
           })
         },
       })

@@ -5,6 +5,7 @@ import { join } from "node:path"
 import {
   bridgeConfigFromOptions,
   configDirectory,
+  createBridge,
   createDiagnosticLogger,
   diagnosticLogPath,
   installBridge,
@@ -85,6 +86,7 @@ function adapterContext(options: {
   const removedTools: string[] = []
   const commands = new Map<string, { execute(input: { sessionID: string }): Promise<void> }>()
   const synthetic: string[] = []
+  const prompts: Array<{ sessionID: string; text: string; resume: false }> = []
   let toolDisposed = 0
   let commandDisposed = 0
   const ctx = {
@@ -119,9 +121,12 @@ function adapterContext(options: {
         return { dispose: async () => { commandDisposed++ } }
       },
     },
-    session: { synthetic: async ({ text }: { text: string }) => synthetic.push(text) },
+    session: {
+      synthetic: async ({ text }: { text: string }) => synthetic.push(text),
+      prompt: async (input: { sessionID: string; text: string; resume: false }) => prompts.push(input),
+    },
   }
-  return { ctx, calls, servers, removedTools, commands, synthetic, get toolDisposed() { return toolDisposed }, get commandDisposed() { return commandDisposed } }
+  return { ctx, calls, servers, removedTools, commands, synthetic, prompts, get toolDisposed() { return toolDisposed }, get commandDisposed() { return commandDisposed } }
 }
 
 function fakeAdapterBridge(initialStatus = adapterStatus("ready")) {
@@ -134,6 +139,10 @@ function fakeAdapterBridge(initialStatus = adapterStatus("ready")) {
       return current
     },
     stop: async () => {
+      lifecycle.push("stop")
+      current = adapterStatus("stopped", current.mode)
+    },
+    detach: async () => {
       lifecycle.push("stop")
       current = adapterStatus("stopped", current.mode)
     },
@@ -368,6 +377,39 @@ describe("MCP readiness probe", () => {
     },
     1_500,
   )
+})
+
+describe("bridge port detection", () => {
+  test("detects an IPv6-only loopback listener without claiming its ownership", async () => {
+    const requests: string[] = []
+    const wslDistroName = process.env.WSL_DISTRO_NAME
+    const wslInterop = process.env.WSL_INTEROP
+    delete process.env.WSL_DISTRO_NAME
+    delete process.env.WSL_INTEROP
+    globalThis.fetch = (async (input) => {
+      const address = String(input)
+      requests.push(address)
+      if (address.startsWith("http://127.0.0.1:")) throw new Error("IPv4 is not listening")
+      return new Response(null, { status: 404 })
+    }) as typeof fetch
+
+    const bridge = createBridge({
+      playwrightHost: "localhost",
+      playwrightPort: 8931,
+      ownerLifecycleRequest: async () => undefined,
+    })
+    const status = await bridge.start()
+    if (wslDistroName === undefined) delete process.env.WSL_DISTRO_NAME
+    else process.env.WSL_DISTRO_NAME = wslDistroName
+    if (wslInterop === undefined) delete process.env.WSL_INTEROP
+    else process.env.WSL_INTEROP = wslInterop
+
+    expect(requests).toEqual(["http://127.0.0.1:8931", "http://[::1]:8931"])
+    expect(status.endpoint.href).toBe("http://localhost:8931/mcp")
+    expect(status.state).toBe("failed")
+    expect(status.reason).toBe("foreign-owned port is already listening")
+    await bridge.stop()
+  })
 })
 
 describe("PlaywrightBridge", () => {
@@ -1163,6 +1205,7 @@ describe("PlaywrightBridge", () => {
     const removedTools: string[] = []
     const commands = new Map<string, { execute(input: { sessionID: string }): Promise<void> }>()
     const synthetic: string[] = []
+    const prompts: Array<{ sessionID: string; text: string; resume: false }> = []
     const ctx = {
       mcp: {
         transform: async (callback: (editor: any) => void) => {
@@ -1192,6 +1235,7 @@ describe("PlaywrightBridge", () => {
       },
       session: {
         synthetic: async ({ text }: { text: string }) => synthetic.push(text),
+        prompt: async (input: { sessionID: string; text: string; resume: false }) => prompts.push(input),
       },
     }
 
@@ -1222,6 +1266,7 @@ describe("PlaywrightBridge", () => {
       "child.kill:4242",
     ])
     expect(synthetic).toEqual([])
+    expect(prompts).toEqual([])
   })
 
   test("the WSL adapter registers the Windows proxy with its resolved bearer token", async () => {
@@ -1304,7 +1349,22 @@ describe("PlaywrightBridge", () => {
       "mcp.reload",
       "mcp.reload",
     ])
-    expect(fake.synthetic.length).toBe(4)
+    expect(fake.synthetic).toEqual([])
+    expect(fake.prompts).toHaveLength(4)
+    expect(fake.prompts.every(({ sessionID, resume }) => sessionID === "session" && resume === false)).toBe(true)
+    expect(fake.prompts[3].text).toBe([
+      "Playwright bridge",
+      "Platform: Windows",
+      "Mode: windows-owner",
+      "State: ready",
+      "Endpoint: http://127.0.0.1:8931/mcp",
+      "PID: 4242",
+      "Patch applied: yes",
+      "Proxy: http://127.0.0.1:8932/mcp",
+      "Proxy state: running",
+      "Extension: connected",
+      "Reason: none",
+    ].join("\n"))
 
     await cleanup()
     expect(fake.commandDisposed).toBe(1)
@@ -1320,6 +1380,7 @@ describe("PlaywrightBridge", () => {
       status: () => failedStatus,
       start: async () => failedStatus,
       stop: async () => undefined,
+      detach: async () => undefined,
       restart: async () => failedStatus,
     } as unknown as PlaywrightBridge
     const failureMessages: string[] = []
@@ -1363,7 +1424,21 @@ describe("PlaywrightBridge", () => {
 
     expect(fake.commands.has("playwright-instructions")).toBe(true)
     await fake.commands.get("playwright-instructions")!.execute({ sessionID: "session" })
-    const instructions = fake.synthetic[0]
+    const instructions = fake.prompts[0].text
+    expect(instructions).toBe([
+      "Playwright setup and next steps",
+      "Current state: wsl-client / failed",
+      "Reason: proxy token=[redacted]",
+      "The extension key belongs on Windows, not in WSL.",
+      "Alternatively, set OPENCODE_PLAYWRIGHT_EXTENSION_TOKEN on the Windows OpenCode service and restart it.",
+      "Proxy key file: /home/user/.config/opencode/.secrets/playwright-mcp-proxy-key",
+      "Start OpenCode on Windows once; it automatically creates the default playwright-mcp-proxy-key if missing.",
+      "Copy the Windows proxy key securely into the WSL OpenCode config, then restart WSL OpenCode.",
+      'WIN_USER="$(cmd.exe /c echo %USERNAME% | tr -d \'\\r\')"',
+      'install -D -m 600 "/mnt/c/Users/$WIN_USER/.config/opencode/.secrets/playwright-mcp-proxy-key" "$HOME/.config/opencode/.secrets/playwright-mcp-proxy-key"',
+      "Adjust the source/destination paths if either OpenCode config directory is customized.",
+      "Diagnostics log (errors only): /home/user/.local/share/opencode/log/opencode-playwright-bridge.log",
+    ].join("\n"))
     expect(instructions).toContain("Current state: wsl-client / failed")
     expect(instructions).toContain("The extension key belongs on Windows, not in WSL")
     expect(instructions).toContain("OPENCODE_PLAYWRIGHT_EXTENSION_TOKEN")
@@ -1385,9 +1460,10 @@ describe("PlaywrightBridge", () => {
       logPath: "/home/user/.local/share/opencode/log/opencode-playwright-bridge.log",
     })
     await customFake.commands.get("playwright-instructions")!.execute({ sessionID: "session" })
-    expect(customFake.synthetic[0]).toContain("A custom proxy token file is configured (/custom/secure-proxy-key)")
-    expect(customFake.synthetic[0]).toContain("never auto-generated")
-    expect(customFake.synthetic[0]).not.toContain("SECRET_MARKER")
+    expect(customFake.prompts[0].text).toContain("A custom proxy token file is configured (/custom/secure-proxy-key)")
+    expect(customFake.prompts[0].text).toContain("never auto-generated")
+    expect(customFake.prompts[0].text).not.toContain("SECRET_MARKER")
+    expect(customFake.synthetic).toEqual([])
     await customCleanup()
   })
 
@@ -1397,16 +1473,18 @@ describe("PlaywrightBridge", () => {
     const cleanup = await installBridge(fake.ctx as any, bridge)
     lifecycle.splice(0)
     fake.synthetic.length = 0
+    fake.prompts.length = 0
 
     await fake.commands.get("playwright-start")!.execute({ sessionID: "session" })
     await fake.commands.get("playwright-stop")!.execute({ sessionID: "session" })
     await fake.commands.get("playwright-restart")!.execute({ sessionID: "session" })
 
     expect(lifecycle).toEqual(["start", "stop", "restart"])
-    expect(fake.synthetic).toHaveLength(3)
-    expect(fake.synthetic[0]).toContain("State: ready")
-    expect(fake.synthetic[1]).toContain("State: stopped")
-    expect(fake.synthetic[2]).toContain("State: ready")
+    expect(fake.prompts).toHaveLength(3)
+    expect(fake.prompts[0].text).toContain("State: ready")
+    expect(fake.prompts[1].text).toContain("State: stopped")
+    expect(fake.prompts[2].text).toContain("State: ready")
+    expect(fake.synthetic).toEqual([])
     await cleanup()
   })
 
@@ -1419,9 +1497,11 @@ describe("PlaywrightBridge", () => {
 
       expect(fake.servers.has("playwright")).toBe(true)
       await fake.commands.get("playwright-status")!.execute({ sessionID: "session" })
-      expect(fake.synthetic[0]).toContain(`State: ${state}`)
-      expect(fake.synthetic[0]).toContain("Proxy: http://127.0.0.1:8932/mcp")
-      expect(fake.synthetic[0]).not.toContain("SECRET_MARKER")
+      expect(fake.prompts[0].text).toContain(`State: ${state}`)
+      expect(fake.prompts[0].text).toContain("Proxy: http://127.0.0.1:8932/mcp")
+      expect(fake.prompts[0].text).not.toContain("SECRET_MARKER")
+      expect(fake.prompts[0]).toMatchObject({ sessionID: "session", resume: false })
+      expect(fake.synthetic).toEqual([])
       await cleanup()
     },
   )

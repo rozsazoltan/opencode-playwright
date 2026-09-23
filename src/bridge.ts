@@ -92,6 +92,7 @@ const SAFE_BUNDLE_PATCH_ERROR_NAMES = [
   "TypeError",
   "URIError",
 ] as const
+const WSL_PROXY_FAST_PROBE_TIMEOUT_MS = 1_000
 
 function integer(value: string | undefined, fallback: number): number {
   if (value === undefined) return fallback
@@ -474,6 +475,15 @@ export class PlaywrightBridge {
     if (failure !== undefined) throw failure
   }
 
+  async detach(): Promise<void> {
+    if (isWsl(this.dependencies)) {
+      ++this.lifecycleGeneration
+      this.setStatus("stopped")
+      return
+    }
+    await this.stop()
+  }
+
   async restart(): Promise<BridgeStatus> {
     const generation = ++this.lifecycleGeneration
     if (isWsl(this.dependencies)) return this.startWsl(generation, "restart")
@@ -502,11 +512,55 @@ export class PlaywrightBridge {
   ): Promise<BridgeStatus> {
     this.setStatus("starting")
 
+    // A running Windows owner may already have a healthy proxy even when no
+    // OpenCode service session is available to receive lifecycle requests.
+    // Only a regular start may use that proxy as a fast-path success; restart
+    // must always reach the owner so it can perform the requested operation.
+    if (action === "start") {
+      try {
+        const token = this.dependencies.readText(this.config.proxyTokenFile).trim()
+        if (token.length > 0) {
+          const result = await this.probeBeforeDeadline(
+            this.config.proxyEndpoint,
+            WSL_PROXY_FAST_PROBE_TIMEOUT_MS,
+            token,
+          )
+          if (!this.isCurrent(generation)) return this.status()
+          if (result.kind === "probe" && result.value.mcp && result.value.extension) {
+            return this.setStatus("ready", undefined, true)
+          }
+        }
+      } catch {
+        // Continue through the owner lifecycle and normal probe path below.
+      }
+    }
+
     if (this.dependencies.requestOwnerLifecycle !== undefined) {
       try {
         await this.dependencies.requestOwnerLifecycle(action)
       } catch {
         if (!this.isCurrent(generation)) return this.status()
+        if (action === "start") {
+          let bearerToken: string
+          try {
+            bearerToken = this.dependencies.readText(this.config.proxyTokenFile).trim()
+            if (bearerToken.length === 0) throw new Error("Playwright proxy token is empty")
+          } catch {
+            return this.setStatus("failed", "Windows Playwright proxy probe failed")
+          }
+          const result = await this.probeBeforeDeadline(
+            this.config.proxyEndpoint,
+            this.config.startupTimeoutMs,
+            bearerToken,
+          )
+          if (!this.isCurrent(generation)) return this.status()
+          if (result.kind === "probe" && result.value.mcp && result.value.extension) {
+            return this.setStatus("ready", undefined, true)
+          }
+          if (result.kind === "error") {
+            return this.setStatus("failed", "Windows Playwright proxy probe failed")
+          }
+        }
         return this.setStatus("failed", "Windows Playwright owner request failed")
       }
     }
