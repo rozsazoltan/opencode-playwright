@@ -478,12 +478,40 @@ describe("PlaywrightBridge", () => {
     expect(writes).toHaveLength(1)
   })
 
-  test("Windows fails closed without spawning when the resolved bundle cannot be patched", async () => {
+  test("Windows reports safe filesystem codes when bundle patching fails without spawning", async () => {
     const dependencies = fakeDependencies()
     dependencies.readText = (path) => path === "playwright-core/lib/coreBundle"
       ? 'async createTarget(url3) {\n        const tab2 = await this._sendToExtension("chrome.tabs.create", [{ url: url3 }]);'
       : "token"
-    dependencies.writeText = () => { throw new Error("private write failure") }
+    dependencies.writeText = () => {
+      throw Object.assign(
+        new Error("C:\\private\\user\\node_modules\\coreBundle.js: access denied"),
+        { code: "EACCES" },
+      )
+    }
+    let spawned = false
+    dependencies.spawn = () => {
+      spawned = true
+      throw new Error("must not spawn")
+    }
+
+    const status = await new PlaywrightBridge(dependencies).start()
+
+    expect(spawned).toBe(false)
+    expect(status).toMatchObject({ state: "failed", reason: "Playwright core bundle could not be patched (EACCES)" })
+    expect(status.reason).not.toContain("private")
+    expect(status.reason).not.toContain("coreBundle.js")
+    expect(status.reason).not.toContain("access denied")
+  })
+
+  test("Windows hides unknown bundle patch errors without spawning", async () => {
+    const dependencies = fakeDependencies()
+    dependencies.readText = (path) => path === "playwright-core/lib/coreBundle"
+      ? 'async createTarget(url3) {\n        const tab2 = await this._sendToExtension("chrome.tabs.create", [{ url: url3 }]);'
+      : "token"
+    dependencies.writeText = () => {
+      throw Object.assign(new Error("C:\\private\\user\\secret details"), { code: "PRIVATE_CODE" })
+    }
     let spawned = false
     dependencies.spawn = () => {
       spawned = true
@@ -494,7 +522,9 @@ describe("PlaywrightBridge", () => {
 
     expect(spawned).toBe(false)
     expect(status).toMatchObject({ state: "failed", reason: "Playwright core bundle could not be patched" })
+    expect(status.reason).not.toContain("PRIVATE_CODE")
     expect(status.reason).not.toContain("private")
+    expect(status.reason).not.toContain("secret details")
   })
 
   test("Windows reports safe diagnostics for prerequisite operation failures", async () => {

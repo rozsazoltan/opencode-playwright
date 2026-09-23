@@ -71,6 +71,14 @@ type OwnerRecord = {
 
 const DEFAULT_BROWSER_EXECUTABLE =
   "C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe"
+const SAFE_BUNDLE_PATCH_ERROR_CODES = [
+  "EACCES",
+  "EPERM",
+  "EBUSY",
+  "ENOENT",
+  "EROFS",
+  "ENOSPC",
+] as const
 
 function integer(value: string | undefined, fallback: number): number {
   if (value === undefined) return fallback
@@ -244,6 +252,17 @@ function ownerLockFailureReason(error: unknown): string {
   return "Playwright owner lock is unavailable"
 }
 
+function bundlePatchFailureReason(error: unknown): string {
+  const code =
+    typeof error === "object" && error !== null && "code" in error
+      ? (error as { code?: unknown }).code
+      : undefined
+  return typeof code === "string" &&
+    SAFE_BUNDLE_PATCH_ERROR_CODES.includes(code as (typeof SAFE_BUNDLE_PATCH_ERROR_CODES)[number])
+    ? `Playwright core bundle could not be patched (${code})`
+    : "Playwright core bundle could not be patched"
+}
+
 function isFileExistsError(error: unknown): boolean {
   return (
     typeof error === "object" &&
@@ -326,6 +345,9 @@ export class PlaywrightBridge {
         "Playwright core bundle could not be checked",
         "Playwright core bundle could not be read",
         "Playwright core bundle could not be patched",
+        ...SAFE_BUNDLE_PATCH_ERROR_CODES.map(
+          (code) => `Playwright core bundle could not be patched (${code})`,
+        ),
         "Playwright core bundle has an unsupported shape",
         "Playwright background-tab patch is missing",
         "Brave executable is missing",
@@ -529,8 +551,8 @@ export class PlaywrightBridge {
       if (patchedBundleText !== coreBundleText) {
         try {
           this.dependencies.writeText(coreBundle, patchedBundleText)
-        } catch {
-          throw new Error("Playwright core bundle could not be patched")
+        } catch (error) {
+          throw new Error(bundlePatchFailureReason(error))
         }
       }
     }
