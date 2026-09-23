@@ -1,9 +1,9 @@
 import { Plugin } from "@opencode/plugin"
-import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs"
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { spawn, spawnSync } from "node:child_process"
 import { createRequire } from "node:module"
 import { homedir } from "node:os"
-import { isAbsolute, join } from "node:path"
+import { dirname, isAbsolute, join } from "node:path"
 import {
   PlaywrightBridge,
   type BridgeConfig,
@@ -21,6 +21,8 @@ let sharedBridge: PlaywrightBridge | undefined
 let sharedProxyToken: string | undefined
 const inFlightStarts = new WeakMap<PlaywrightBridge, Promise<BridgeStatus>>()
 const bridgeReferences = new WeakMap<PlaywrightBridge, { count: number }>()
+const loggedStartupFailures = new WeakMap<PlaywrightBridge, string>()
+const loggedSetupErrors = new WeakSet<object>()
 
 type PluginContext = Parameters<NonNullable<Parameters<typeof Plugin.define>[0]["setup"]>>[0]
 type PluginOptions = Readonly<Record<string, unknown>>
@@ -28,14 +30,22 @@ type PluginOptions = Readonly<Record<string, unknown>>
 type OwnerLifecycleRequester = (action: OwnerLifecycleAction) => Promise<void>
 type DiagnosticLogger = (message: string) => void
 
-function diagnosticLogger(configDir: string): DiagnosticLogger {
+export function diagnosticLogPath(
+  env: NodeJS.ProcessEnv = process.env,
+  homeDirectory: string = homedir(),
+): string {
+  return join(env.XDG_DATA_HOME || join(homeDirectory, ".local", "share"), "opencode", "log", "opencode-playwright-bridge.log")
+}
+
+export function createDiagnosticLogger(
+  env: NodeJS.ProcessEnv = process.env,
+  homeDirectory: string = homedir(),
+): DiagnosticLogger {
+  const path = diagnosticLogPath(env, homeDirectory)
   return (message) => {
     try {
-      appendFileSync(
-        join(configDir, "playwright-startup.log"),
-        `[${new Date().toISOString()}] ${redacted(message)}\n`,
-        "utf8",
-      )
+      mkdirSync(dirname(path), { recursive: true })
+      appendFileSync(path, `[${new Date().toISOString()}] ${redacted(message)}\n`, "utf8")
     } catch {
       // Diagnostics must never prevent plugin startup.
     }
@@ -43,11 +53,7 @@ function diagnosticLogger(configDir: string): DiagnosticLogger {
 }
 
 function diagnosticError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error)
-}
-
-function diagnosticStatus(status: BridgeStatus): string {
-  return `mode=${status.mode} state=${status.state} pid=${status.pid ?? "none"} proxy=${status.proxyRunning ? "running" : "stopped"} reason=${status.reason ?? "none"}`
+  return error instanceof Error ? "unexpected error" : "unknown error"
 }
 
 function requestWindowsOwnerLifecycle(
@@ -149,6 +155,9 @@ export function bridgeConfigFromOptions(
     optionString(options, "proxyTokenFile") ??
     env.OPENCODE_PLAYWRIGHT_PROXY_TOKEN_FILE ??
     ".secrets/playwright-mcp-proxy-key"
+  const autoGenerateProxyToken =
+    optionString(options, "proxyTokenFile") === undefined &&
+    env.OPENCODE_PLAYWRIGHT_PROXY_TOKEN_FILE === undefined
 
   return {
     configDir,
@@ -167,6 +176,7 @@ export function bridgeConfigFromOptions(
       optionString(options, "profileDirName") ?? env.OPENCODE_PLAYWRIGHT_PROFILE_DIR_NAME ?? "Default",
     extensionTokenFile: resolvedSecretPath(configDir, extensionTokenFile),
     proxyTokenFile: resolvedSecretPath(configDir, proxyTokenFile),
+    autoGenerateProxyToken,
     startupTimeoutMs: optionInteger(
       options,
       "startupTimeoutMs",
@@ -446,6 +456,51 @@ function statusText(status: BridgeStatus): string {
   ].join("\n")
 }
 
+type SetupDetails = {
+  configDir: string
+  extensionTokenFile: string
+  proxyTokenFile: string
+  customProxyTokenPath: boolean
+  logPath: string
+}
+
+export function playwrightInstructions(status: BridgeStatus, details: SetupDetails): string {
+  const lines = [
+    "Playwright setup and next steps",
+    `Current state: ${status.mode} / ${status.state}`,
+    `Reason: ${status.reason ? redacted(status.reason) : "none"}`,
+    status.mode === "wsl-client"
+      ? "The extension key belongs on Windows, not in WSL."
+      : `Windows extension key: ${details.extensionTokenFile}`,
+    "Alternatively, set OPENCODE_PLAYWRIGHT_EXTENSION_TOKEN on the Windows OpenCode service and restart it.",
+  ]
+  if (status.mode === "wsl-client") {
+    lines.push(
+      `Proxy key file: ${details.proxyTokenFile}`,
+      details.customProxyTokenPath
+        ? "A custom proxy token file is configured; ensure the same key is securely available at the configured path on Windows and WSL."
+        : "Start OpenCode on Windows once; it automatically creates the default playwright-mcp-proxy-key if missing.",
+      "Copy the Windows proxy key securely into the WSL OpenCode config, then restart WSL OpenCode.",
+    )
+    if (!details.customProxyTokenPath) {
+      lines.push(
+        'WIN_USER="$(cmd.exe /c echo %USERNAME% | tr -d \'\\r\')"',
+        'install -D -m 600 "/mnt/c/Users/$WIN_USER/.config/opencode/.secrets/playwright-mcp-proxy-key" "$HOME/.config/opencode/.secrets/playwright-mcp-proxy-key"',
+        "Adjust the source/destination paths if either OpenCode config directory is customized.",
+      )
+    }
+  } else {
+    lines.push(
+      details.customProxyTokenPath
+        ? `A custom proxy token file is configured (${details.proxyTokenFile}); it must already exist and is never auto-generated.`
+        : `Windows automatically creates the default proxy key if missing: ${details.proxyTokenFile}`,
+      "For WSL, securely copy the Windows-generated proxy key to WSL and restart WSL OpenCode.",
+    )
+  }
+  lines.push(`Diagnostics log (errors only): ${details.logPath}`)
+  return lines.join("\n")
+}
+
 function needsOwnerStartupRetry(status: BridgeStatus): boolean {
   return (
     status.mode === "windows-owner" &&
@@ -498,8 +553,8 @@ export async function installBridge(
   bridge: PlaywrightBridge,
   proxyToken?: string,
   diagnostic?: DiagnosticLogger,
+  setupDetails?: SetupDetails,
 ): Promise<() => Promise<void>> {
-  diagnostic?.("installBridge begin")
   const releaseBridge = retainBridge(bridge)
   let desiredStatus: BridgeStatus | undefined
   let mcpRegistration: Awaited<ReturnType<PluginContext["mcp"]["transform"]>> | undefined
@@ -510,6 +565,17 @@ export async function installBridge(
   let retryAttempts = 0
   let retryLimit: number | undefined
   let cleaned = false
+  const instructionDetails = setupDetails ?? (() => {
+    const configDir = configDirectory()
+    const config = bridgeConfigFromOptions({}, configDir)
+    return {
+      configDir,
+      extensionTokenFile: config.extensionTokenFile!,
+      proxyTokenFile: config.proxyTokenFile!,
+      customProxyTokenPath: false,
+      logPath: diagnosticLogPath(),
+    }
+  })()
 
   const stopRetry = () => {
     if (retryTimer !== undefined) {
@@ -571,11 +637,22 @@ export async function installBridge(
   try {
     const configuredStatus = bridge.status()
     await reloadRegistration(configuredStatus)
-    diagnostic?.(`initial MCP registration: ${diagnosticStatus(configuredStatus)}`)
     const initialStatus = await startBridge(bridge)
-    diagnostic?.(`bridge start: ${diagnosticStatus(initialStatus)}`)
+    if (initialStatus.state !== "ready") {
+      const reason = initialStatus.reason === "Playwright proxy token file is missing"
+        ? instructionDetails.customProxyTokenPath
+          ? "configured proxy token file is missing"
+          : "default proxy token file is missing"
+        : initialStatus.reason ?? "bridge did not become ready"
+      const failure = `Bridge startup failed (mode=${initialStatus.mode}): ${reason}`
+      if (loggedStartupFailures.get(bridge) !== failure) {
+        loggedStartupFailures.set(bridge, failure)
+        diagnostic?.(failure)
+      }
+    } else {
+      loggedStartupFailures.delete(bridge)
+    }
     await reloadRegistration(initialStatus)
-    diagnostic?.("MCP registration reload complete")
     if (initialStatus.mode === "wsl-client" && initialStatus.state !== "ready") {
       retryRegistration()
     } else if (needsOwnerStartupRetry(initialStatus)) {
@@ -628,6 +705,16 @@ export async function installBridge(
         description: "Show Playwright bridge status",
         execute: async ({ sessionID }) => emitStatus(ctx, sessionID, bridge.status()),
       })
+      editor.add({
+        name: "playwright-instructions",
+        description: "Show Playwright setup and next steps",
+        execute: async ({ sessionID }) => {
+          await ctx.session.synthetic({
+            sessionID,
+            text: playwrightInstructions(bridge.status(), instructionDetails),
+          })
+        },
+      })
     })
 
     return async () => {
@@ -659,6 +746,7 @@ export async function installBridge(
     }
   } catch (error) {
     diagnostic?.(`installBridge failed: ${diagnosticError(error)}`)
+    if (typeof error === "object" && error !== null) loggedSetupErrors.add(error)
     cleaned = true
     stopRetry()
     try {
@@ -684,8 +772,9 @@ export async function installBridge(
 export default Plugin.define({
   id: "playwright-bridge",
   async setup(ctx) {
-    const log = diagnosticLogger(configDirectory())
-    log("setup begin")
+    const configDir = configDirectory()
+    const config = bridgeConfigFromOptions(ctx.options, configDir)
+    const log = createDiagnosticLogger()
     if (sharedBridge === undefined) {
       sharedBridge = createBridge(ctx.options)
       if (process.platform !== "win32") {
@@ -699,11 +788,20 @@ export default Plugin.define({
       }
     }
     try {
-      const cleanup = await installBridge(ctx, sharedBridge, sharedProxyToken, log)
-      log("setup complete")
+      const cleanup = await installBridge(ctx, sharedBridge, sharedProxyToken, log, {
+        configDir,
+        extensionTokenFile: config.extensionTokenFile!,
+        proxyTokenFile: config.proxyTokenFile!,
+        customProxyTokenPath:
+          optionString(ctx.options, "proxyTokenFile") !== undefined ||
+          process.env.OPENCODE_PLAYWRIGHT_PROXY_TOKEN_FILE !== undefined,
+        logPath: diagnosticLogPath(),
+      })
       return cleanup
     } catch (error) {
-      log(`setup failed: ${diagnosticError(error)}`)
+      if (typeof error !== "object" || error === null || !loggedSetupErrors.has(error)) {
+        log(`Setup failed: ${diagnosticError(error)}`)
+      }
       throw error
     }
   },

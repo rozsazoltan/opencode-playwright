@@ -1,4 +1,5 @@
-import { closeSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { closeSync, linkSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { randomBytes } from "node:crypto"
 import { dirname, join, resolve } from "node:path"
 import { patchPlaywrightBundle } from "../scripts/patch-playwright.mjs"
 import { startProxy, type ProxyOptions, type StartedProxy } from "./proxy"
@@ -19,6 +20,7 @@ export type BridgeConfig = {
   profileDirName: string
   extensionTokenFile: string
   proxyTokenFile: string
+  autoGenerateProxyToken?: boolean
   ownerFile: string
   startupTimeoutMs: number
   startupPollMs: number
@@ -290,6 +292,7 @@ function isFileExistsError(error: unknown): boolean {
 
 export class PlaywrightBridge {
   private readonly config: BridgeConfig
+  private readonly createDefaultProxyToken: boolean
   private current: BridgeStatus
   private childPid?: number
   private patchVerified = false
@@ -303,6 +306,8 @@ export class PlaywrightBridge {
     config: Partial<BridgeConfig> = {},
   ) {
     this.config = resolveConfig(dependencies, config)
+    this.createDefaultProxyToken = config.autoGenerateProxyToken ??
+      (config.proxyTokenFile === undefined && dependencies.env.OPENCODE_PLAYWRIGHT_PROXY_TOKEN_FILE === undefined)
     this.current = this.makeStatus("stopped")
   }
 
@@ -339,6 +344,7 @@ export class PlaywrightBridge {
     let resolvedMcpCli: string
     let extensionToken: string
     try {
+      this.ensureDefaultProxyToken()
       resolvedMcpCli = this.validateWindowsPrerequisites()
       const environmentToken = this.dependencies.env.OPENCODE_PLAYWRIGHT_EXTENSION_TOKEN
       if (environmentToken === undefined) {
@@ -382,6 +388,9 @@ export class PlaywrightBridge {
         "Playwright extension token file could not be read",
         "Playwright proxy token file is missing",
         "Playwright proxy token file could not be checked",
+        "Playwright proxy token file could not be read",
+        "Playwright proxy token is empty",
+        "Playwright default proxy token could not be created",
         "Playwright extension token is empty",
       ]
       const reason = error instanceof Error && safeReasons.includes(error.message)
@@ -616,8 +625,61 @@ export class PlaywrightBridge {
     if (!proxyTokenExists) {
       throw new Error("Playwright proxy token file is missing")
     }
+    let proxyToken: string
+    try {
+      proxyToken = this.dependencies.readText(this.config.proxyTokenFile).trim()
+    } catch {
+      throw new Error("Playwright proxy token file could not be read")
+    }
+    if (proxyToken.length === 0) throw new Error("Playwright proxy token is empty")
 
     return resolvedMcpCli
+  }
+
+  private ensureDefaultProxyToken(): void {
+    if (!this.createDefaultProxyToken || this.dependencies.platform !== "win32") return
+
+    const path = this.config.proxyTokenFile
+    try {
+      if (this.dependencies.fileExists(path)) return
+    } catch {
+      throw new Error("Playwright proxy token file could not be checked")
+    }
+    const directory = dirname(path)
+
+    let temporaryPath: string | undefined
+    let descriptor: number | undefined
+    try {
+      mkdirSync(directory, { recursive: true, mode: 0o700 })
+      temporaryPath = join(directory, `.playwright-mcp-proxy-key-${randomBytes(16).toString("hex")}.tmp`)
+      descriptor = openSync(temporaryPath, "wx", 0o600)
+      writeFileSync(descriptor, randomBytes(32).toString("hex"), "utf8")
+      closeSync(descriptor)
+      descriptor = undefined
+
+      try {
+        linkSync(temporaryPath, path)
+      } catch (error) {
+        if (!isFileExistsError(error)) throw error
+      }
+    } catch {
+      throw new Error("Playwright default proxy token could not be created")
+    } finally {
+      if (descriptor !== undefined) {
+        try {
+          closeSync(descriptor)
+        } catch {
+          // Do not expose filesystem details from best-effort cleanup.
+        }
+      }
+      if (temporaryPath !== undefined) {
+        try {
+          rmSync(temporaryPath, { force: true })
+        } catch {
+          // The temporary file is unique to this attempt; leave it rather than affecting the target.
+        }
+      }
+    }
   }
 
   private async acquireOwnerRecord(): Promise<void> {

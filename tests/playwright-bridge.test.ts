@@ -1,10 +1,12 @@
 import { afterEach, describe, expect, test } from "bun:test"
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import {
   bridgeConfigFromOptions,
   configDirectory,
+  createDiagnosticLogger,
+  diagnosticLogPath,
   installBridge,
   probeMcp,
   proxyTokenReference,
@@ -179,6 +181,24 @@ describe("playwright bridge plugin options", () => {
     const exists = () => false
 
     expect(configDirectory({}, "C:\\home", exists)).toBe(join("C:\\home", ".config", "opencode"))
+  })
+
+  test("resolves error diagnostics to the OpenCode log directory without exposing secrets", () => {
+    expect(diagnosticLogPath({ XDG_DATA_HOME: "/data/custom" }, "/home/test")).toBe(
+      join("/data/custom", "opencode", "log", "opencode-playwright-bridge.log"),
+    )
+    expect(diagnosticLogPath({}, "/home/test")).toBe(
+      join("/home/test", ".local", "share", "opencode", "log", "opencode-playwright-bridge.log"),
+    )
+
+    const dataHome = mkdtempSync(join(tmpdir(), "playwright-log-test-"))
+    temporaryDirectories.add(dataHome)
+    createDiagnosticLogger({ XDG_DATA_HOME: dataHome }, "/unused")(
+      "Bridge failed with Bearer sensitive-marker",
+    )
+    const output = readFileSync(diagnosticLogPath({ XDG_DATA_HOME: dataHome }), "utf8")
+    expect(output).toContain("Bearer [redacted]")
+    expect(output).not.toContain("sensitive-marker")
   })
 
   test("maps owner options and normalizes a non-loopback Playwright host", () => {
@@ -618,10 +638,12 @@ describe("PlaywrightBridge", () => {
         expected: "Playwright extension token file could not be read",
         fail: (dependencies) => {
           dependencies.readText = (path) => {
+            if (path.endsWith("playwright-mcp-proxy-key")) return "generated-proxy-token"
             if (path === "playwright-core/lib/coreBundle") {
               return 'async createTarget(url3) { this._sendToExtension("chrome.tabs.create", [{ url: url3, active: false }]) }'
             }
-            throw new Error("C:\\private\\secrets\\playwright-key")
+            if (path.endsWith("playwright-key")) throw new Error("C:\\private\\secrets\\playwright-key")
+            return "unexpected"
           }
         },
       },
@@ -1190,6 +1212,7 @@ describe("PlaywrightBridge", () => {
     expect(commands.has("playwright-stop")).toBe(true)
     expect(commands.has("playwright-restart")).toBe(true)
     expect(commands.has("playwright-status")).toBe(true)
+    expect(commands.has("playwright-instructions")).toBe(true)
 
     calls.splice(0)
     await cleanup()
@@ -1286,6 +1309,86 @@ describe("PlaywrightBridge", () => {
     await cleanup()
     expect(fake.commandDisposed).toBe(1)
     expect(fake.toolDisposed).toBe(1)
+  })
+
+  test("startup diagnostics log only failures and distinguish the proxy token file", async () => {
+    const failedStatus: BridgeStatus = {
+      ...adapterStatus("failed"),
+      reason: "Playwright proxy token file is missing",
+    }
+    const failedBridge = {
+      status: () => failedStatus,
+      start: async () => failedStatus,
+      stop: async () => undefined,
+      restart: async () => failedStatus,
+    } as unknown as PlaywrightBridge
+    const failureMessages: string[] = []
+    const failedCleanup = await installBridge(
+      adapterContext().ctx as any,
+      failedBridge,
+      undefined,
+      (message) => failureMessages.push(message),
+    )
+
+    expect(failureMessages).toEqual([
+      "Bridge startup failed (mode=windows-owner): default proxy token file is missing",
+    ])
+    expect(failureMessages.join("\n")).not.toContain("SECRET_MARKER")
+    await failedCleanup()
+
+    const { bridge } = fakeAdapterBridge()
+    const successMessages: string[] = []
+    const successCleanup = await installBridge(
+      adapterContext().ctx as any,
+      bridge,
+      undefined,
+      (message) => successMessages.push(message),
+    )
+    expect(successMessages).toEqual([])
+    await successCleanup()
+  })
+
+  test("instructions are registered on failed startup and give safe WSL setup steps", async () => {
+    const failed = adapterStatus("failed", "wsl-client")
+    failed.reason = "Windows Playwright proxy probe failed"
+    const { bridge } = fakeAdapterBridge(failed)
+    const fake = adapterContext()
+    const cleanup = await installBridge(fake.ctx as any, bridge, undefined, undefined, {
+      configDir: "/home/user/.config/opencode",
+      extensionTokenFile: "/home/user/.config/opencode/.secrets/playwright-key",
+      proxyTokenFile: "/home/user/.config/opencode/.secrets/playwright-mcp-proxy-key",
+      customProxyTokenPath: false,
+      logPath: "/home/user/.local/share/opencode/log/opencode-playwright-bridge.log",
+    })
+
+    expect(fake.commands.has("playwright-instructions")).toBe(true)
+    await fake.commands.get("playwright-instructions")!.execute({ sessionID: "session" })
+    const instructions = fake.synthetic[0]
+    expect(instructions).toContain("Current state: wsl-client / failed")
+    expect(instructions).toContain("The extension key belongs on Windows, not in WSL")
+    expect(instructions).toContain("OPENCODE_PLAYWRIGHT_EXTENSION_TOKEN")
+    expect(instructions).toContain("Copy the Windows proxy key securely")
+    expect(instructions).toContain("install -D -m 600")
+    expect(instructions).toContain("restart WSL OpenCode")
+    expect(instructions).toContain("opencode-playwright-bridge.log")
+    expect(instructions).not.toContain("SECRET_MARKER")
+    await cleanup()
+
+    const customFake = adapterContext()
+    const customStatus = adapterStatus("failed")
+    const { bridge: customBridge } = fakeAdapterBridge(customStatus)
+    const customCleanup = await installBridge(customFake.ctx as any, customBridge, undefined, undefined, {
+      configDir: "/home/user/.config/opencode",
+      extensionTokenFile: "/home/user/.config/opencode/.secrets/playwright-key",
+      proxyTokenFile: "/custom/secure-proxy-key",
+      customProxyTokenPath: true,
+      logPath: "/home/user/.local/share/opencode/log/opencode-playwright-bridge.log",
+    })
+    await customFake.commands.get("playwright-instructions")!.execute({ sessionID: "session" })
+    expect(customFake.synthetic[0]).toContain("A custom proxy token file is configured (/custom/secure-proxy-key)")
+    expect(customFake.synthetic[0]).toContain("never auto-generated")
+    expect(customFake.synthetic[0]).not.toContain("SECRET_MARKER")
+    await customCleanup()
   })
 
   test("WSL lifecycle commands control the Windows owner and report status", async () => {
