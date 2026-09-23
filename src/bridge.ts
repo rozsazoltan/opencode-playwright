@@ -79,6 +79,17 @@ const SAFE_BUNDLE_PATCH_ERROR_CODES = [
   "EROFS",
   "ENOSPC",
 ] as const
+const SAFE_BUNDLE_PATCH_ERROR_NAMES = [
+  "AggregateError",
+  "DOMException",
+  "Error",
+  "EvalError",
+  "RangeError",
+  "ReferenceError",
+  "SyntaxError",
+  "TypeError",
+  "URIError",
+] as const
 
 function integer(value: string | undefined, fallback: number): number {
   if (value === undefined) return fallback
@@ -253,13 +264,18 @@ function ownerLockFailureReason(error: unknown): string {
 }
 
 function bundlePatchFailureReason(error: unknown): string {
-  const code =
-    typeof error === "object" && error !== null && "code" in error
-      ? (error as { code?: unknown }).code
-      : undefined
-  return typeof code === "string" &&
-    SAFE_BUNDLE_PATCH_ERROR_CODES.includes(code as (typeof SAFE_BUNDLE_PATCH_ERROR_CODES)[number])
-    ? `Playwright core bundle could not be patched (${code})`
+  const details = typeof error === "object" && error !== null ? error as { code?: unknown; name?: unknown } : {}
+  const code = typeof details.code === "string" &&
+    SAFE_BUNDLE_PATCH_ERROR_CODES.includes(details.code as (typeof SAFE_BUNDLE_PATCH_ERROR_CODES)[number])
+    ? details.code
+    : undefined
+  const name = typeof details.name === "string" &&
+    SAFE_BUNDLE_PATCH_ERROR_NAMES.includes(details.name as (typeof SAFE_BUNDLE_PATCH_ERROR_NAMES)[number])
+    ? details.name
+    : undefined
+  const diagnostic = [code, name].filter((value) => value !== undefined).join(", ")
+  return diagnostic.length > 0
+    ? `Playwright core bundle could not be patched (${diagnostic})`
     : "Playwright core bundle could not be patched"
 }
 
@@ -345,8 +361,17 @@ export class PlaywrightBridge {
         "Playwright core bundle could not be checked",
         "Playwright core bundle could not be read",
         "Playwright core bundle could not be patched",
+        "Playwright core bundle patch writer is unavailable",
         ...SAFE_BUNDLE_PATCH_ERROR_CODES.map(
           (code) => `Playwright core bundle could not be patched (${code})`,
+        ),
+        ...SAFE_BUNDLE_PATCH_ERROR_NAMES.map(
+          (name) => `Playwright core bundle could not be patched (${name})`,
+        ),
+        ...SAFE_BUNDLE_PATCH_ERROR_CODES.flatMap((code) =>
+          SAFE_BUNDLE_PATCH_ERROR_NAMES.map(
+            (name) => `Playwright core bundle could not be patched (${code}, ${name})`,
+          ),
         ),
         "Playwright core bundle has an unsupported shape",
         "Playwright background-tab patch is missing",
@@ -549,6 +574,9 @@ export class PlaywrightBridge {
         throw new Error("Playwright core bundle has an unsupported shape")
       }
       if (patchedBundleText !== coreBundleText) {
+        if (typeof this.dependencies.writeText !== "function") {
+          throw new Error("Playwright core bundle patch writer is unavailable")
+        }
         try {
           this.dependencies.writeText(coreBundle, patchedBundleText)
         } catch (error) {

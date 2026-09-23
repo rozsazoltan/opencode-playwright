@@ -498,19 +498,22 @@ describe("PlaywrightBridge", () => {
     const status = await new PlaywrightBridge(dependencies).start()
 
     expect(spawned).toBe(false)
-    expect(status).toMatchObject({ state: "failed", reason: "Playwright core bundle could not be patched (EACCES)" })
+    expect(status).toMatchObject({ state: "failed", reason: "Playwright core bundle could not be patched (EACCES, Error)" })
     expect(status.reason).not.toContain("private")
     expect(status.reason).not.toContain("coreBundle.js")
     expect(status.reason).not.toContain("access denied")
   })
 
-  test("Windows hides unknown bundle patch errors without spawning", async () => {
+  test("Windows reports allowlisted error names and codes while redacting unknown details", async () => {
     const dependencies = fakeDependencies()
     dependencies.readText = (path) => path === "playwright-core/lib/coreBundle"
       ? 'async createTarget(url3) {\n        const tab2 = await this._sendToExtension("chrome.tabs.create", [{ url: url3 }]);'
       : "token"
     dependencies.writeText = () => {
-      throw Object.assign(new Error("C:\\private\\user\\secret details"), { code: "PRIVATE_CODE" })
+      throw Object.assign(new TypeError("C:\\private\\user\\secret details"), {
+        code: "EACCES",
+        path: "C:\\private\\user\\coreBundle.js",
+      })
     }
     let spawned = false
     dependencies.spawn = () => {
@@ -521,10 +524,55 @@ describe("PlaywrightBridge", () => {
     const status = await new PlaywrightBridge(dependencies).start()
 
     expect(spawned).toBe(false)
-    expect(status).toMatchObject({ state: "failed", reason: "Playwright core bundle could not be patched" })
-    expect(status.reason).not.toContain("PRIVATE_CODE")
+    expect(status).toMatchObject({
+      state: "failed",
+      reason: "Playwright core bundle could not be patched (EACCES, TypeError)",
+    })
     expect(status.reason).not.toContain("private")
     expect(status.reason).not.toContain("secret details")
+    expect(status.reason).not.toContain("coreBundle.js")
+    expect(status.reason).not.toContain("path")
+  })
+
+  test("Windows redacts unrecognized bundle patch error names and codes", async () => {
+    const dependencies = fakeDependencies()
+    dependencies.readText = (path) => path === "playwright-core/lib/coreBundle"
+      ? 'async createTarget(url3) {\n        const tab2 = await this._sendToExtension("chrome.tabs.create", [{ url: url3 }]);'
+      : "token"
+    dependencies.writeText = () => {
+      throw Object.assign(new Error("private failure"), {
+        name: "PrivateErrorName",
+        code: "PRIVATE_CODE",
+      })
+    }
+
+    const status = await new PlaywrightBridge(dependencies).start()
+
+    expect(status.reason).toBe("Playwright core bundle could not be patched")
+    expect(status.reason).not.toContain("PrivateErrorName")
+    expect(status.reason).not.toContain("PRIVATE_CODE")
+    expect(status.reason).not.toContain("private failure")
+  })
+
+  test("Windows identifies a missing bundle patch writer without spawning", async () => {
+    const dependencies = fakeDependencies()
+    dependencies.readText = (path) => path === "playwright-core/lib/coreBundle"
+      ? 'async createTarget(url3) {\n        const tab2 = await this._sendToExtension("chrome.tabs.create", [{ url: url3 }]);'
+      : "token"
+    dependencies.writeText = undefined as unknown as BridgeDependencies["writeText"]
+    let spawned = false
+    dependencies.spawn = () => {
+      spawned = true
+      throw new Error("must not spawn")
+    }
+
+    const status = await new PlaywrightBridge(dependencies).start()
+
+    expect(spawned).toBe(false)
+    expect(status).toMatchObject({
+      state: "failed",
+      reason: "Playwright core bundle patch writer is unavailable",
+    })
   })
 
   test("Windows reports safe diagnostics for prerequisite operation failures", async () => {
