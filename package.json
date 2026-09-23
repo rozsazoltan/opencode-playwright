@@ -8,10 +8,13 @@
     ".": "./src/index.ts"
   },
   "scripts": {
+    "postinstall": "node scripts/patch-playwright.mjs",
     "test": "bun test tests"
   },
   "files": [
     "src",
+    "scripts",
+    "patches",
     "LICENSE",
     "README.md",
     "package.json"

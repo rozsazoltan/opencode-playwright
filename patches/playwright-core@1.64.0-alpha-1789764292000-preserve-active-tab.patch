@@ -1,0 +1,10 @@
+diff --git a/lib/coreBundle.js b/lib/coreBundle.js
+--- a/lib/coreBundle.js
++++ b/lib/coreBundle.js
+@@ -74221,5 +74221,5 @@
+       async createTarget(url3) {
+-        const tab2 = await this._sendToExtension("chrome.tabs.create", [{ url: url3 }]);
++        const tab2 = await this._sendToExtension("chrome.tabs.create", [{ url: url3, active: false }]);
+         if (tab2?.id === void 0)
+           throw new Error("Failed to create tab");
+         this._knownTabs.set(tab2.id, tab2);

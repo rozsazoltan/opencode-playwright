@@ -23,16 +23,16 @@ The plugin expects the normal OpenCode Playwright extension and token setup used
 the bridge. See the environment variable names in `src/index.ts`
 for optional host, port, executable, profile, token-file, and timeout overrides.
 
-## Playwright patch note
+## Playwright focus patch
 
-The bridge checks that its resolved `playwright-core` bundle contains the required
-no-focus behavior before starting the Windows owner. Patch files in this repository
-are maintainer artifacts, not a patched Playwright runtime.
+On installation, the package applies the version-pinned patch to its own resolved
+`playwright-core` bundle. The extension creates new tabs with `active: false`, keeping
+the user's previously active tab focused. The bridge verifies this patch before
+starting the Windows owner and fails closed if the expected bundle shape is not found.
 
-Package-local `patchedDependencies` metadata cannot patch OpenCode's separately
-resolved Playwright runtime. This package therefore does not claim to ship or
-install a patched runtime. Ensure the Playwright runtime resolved by OpenCode has
-the required behavior before using the Windows owner mode.
+The patch runs from the package's `postinstall` script, so install scripts must be
+enabled. The patch artifact under `patches/` is kept for review and reproducibility;
+the install script applies the same narrowly scoped source change.
 
 ## Development
 

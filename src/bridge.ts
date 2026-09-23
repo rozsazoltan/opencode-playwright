@@ -115,11 +115,11 @@ function playwrightArguments(config: BridgeConfig, mcpCli: string): string[] {
   ]
 }
 
-function hasNoFocusPatch(source: string): boolean {
-  const methodStart = source.indexOf("doCreateNewPage()")
+function hasBackgroundTabPatch(source: string): boolean {
+  const methodStart = source.indexOf("async createTarget(url3)")
   if (methodStart < 0) return false
   const method = source.slice(methodStart, methodStart + 2_000)
-  return method.includes("background: true") && method.includes("focus: false")
+  return method.includes('"chrome.tabs.create"') && method.includes("active: false")
 }
 
 function wslGateway(dependencies: BridgeDependencies): string | undefined {
@@ -306,7 +306,19 @@ export class PlaywrightBridge {
       extensionToken = this.dependencies.readText(this.config.extensionTokenFile).trim()
       if (extensionToken.length === 0) throw new Error("Playwright extension token is empty")
     } catch (error) {
-      return this.setStatus("failed", "Playwright prerequisites validation failed")
+      const safeReasons = [
+        "Playwright MCP entrypoint is missing",
+        "Playwright core bundle is missing",
+        "Playwright background-tab patch is missing",
+        "Brave executable is missing",
+        "Playwright extension token file is missing",
+        "Playwright proxy token file is missing",
+        "Playwright extension token is empty",
+      ]
+      const reason = error instanceof Error && safeReasons.includes(error.message)
+        ? error.message
+        : "Playwright prerequisites validation failed"
+      return this.setStatus("failed", reason)
     }
     try {
       await this.acquireOwnerRecord()
@@ -455,8 +467,8 @@ export class PlaywrightBridge {
     if (!this.dependencies.fileExists(coreBundle)) {
       throw new Error("Playwright core bundle is missing")
     }
-    if (!hasNoFocusPatch(this.dependencies.readText(coreBundle))) {
-      throw new Error("Playwright no-focus patch is missing")
+    if (!hasBackgroundTabPatch(this.dependencies.readText(coreBundle))) {
+      throw new Error("Playwright background-tab patch is missing")
     }
     this.patchVerified = true
 

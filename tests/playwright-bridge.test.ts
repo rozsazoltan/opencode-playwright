@@ -30,7 +30,7 @@ function fakeDependencies(): BridgeDependencies {
     platform: "win32",
     env: { OPENCODE_CONFIG_DIR: configDir },
     fileExists: () => true,
-    readText: () => "async doCreateNewPage() { background: true; focus: false }",
+    readText: () => 'async createTarget(url3) { this._sendToExtension("chrome.tabs.create", [{ url: url3, active: false }]) }',
     resolve: (name) => name,
     isPortOpen: async () => false,
     spawn: () => ({ pid: 4242, onExit: () => undefined }),
@@ -358,7 +358,7 @@ describe("PlaywrightBridge", () => {
     dependencies.readText = (path) =>
       path.endsWith("playwright-key")
         ? "  extension-token-fixture  \n"
-        : "async doCreateNewPage() { background: true; focus: false }"
+        : 'async createTarget(url3) { this._sendToExtension("chrome.tabs.create", [{ url: url3, active: false }]) }'
     dependencies.spawn = (_command, _args, options) => {
       childEnvironment = options.env
       return { pid: 4242, onExit: () => undefined }
@@ -380,7 +380,7 @@ describe("PlaywrightBridge", () => {
     dependencies.readText = (path) =>
       path.endsWith("playwright-key")
         ? " \n\t "
-        : "async doCreateNewPage() { background: true; focus: false }"
+        : 'async createTarget(url3) { this._sendToExtension("chrome.tabs.create", [{ url: url3, active: false }]) }'
     dependencies.spawn = () => {
       spawned = true
       throw new Error("must not spawn")
@@ -391,7 +391,19 @@ describe("PlaywrightBridge", () => {
     expect(spawned).toBe(false)
     expect(status).toMatchObject({
       state: "failed",
-      reason: "Playwright prerequisites validation failed",
+      reason: "Playwright extension token is empty",
+    })
+  })
+
+  test("Windows reports when the background-tab patch is missing", async () => {
+    const dependencies = fakeDependencies()
+    dependencies.readText = () => "async createTarget(url3) {}"
+
+    const status = await new PlaywrightBridge(dependencies).start()
+
+    expect(status).toMatchObject({
+      state: "failed",
+      reason: "Playwright background-tab patch is missing",
     })
   })
 
@@ -403,7 +415,7 @@ describe("PlaywrightBridge", () => {
     let receivedBinding = false
     dependencies.readText = (path) => {
        if (path.endsWith("playwright-mcp-proxy-key")) return "proxy-token\n"
-      return "async doCreateNewPage() { background: true; focus: false }"
+      return 'async createTarget(url3) { this._sendToExtension("chrome.tabs.create", [{ url: url3, active: false }]) }'
     }
     dependencies.probeMcp = async () => {
       events.push("probe")
@@ -533,7 +545,7 @@ describe("PlaywrightBridge", () => {
     dependencies.readText = (path) =>
       path.endsWith("playwright-mcp-proxy-key")
         ? "wsl-proxy-token-fixture\n"
-        : "async doCreateNewPage() { background: true; focus: false }"
+        : 'async createTarget(url3) { this._sendToExtension("chrome.tabs.create", [{ url: url3, active: false }]) }'
     dependencies.probeMcp = async (_endpoint, bearerToken) => {
       probeToken = bearerToken
       return { mcp: true, extension: true }
@@ -564,7 +576,7 @@ describe("PlaywrightBridge", () => {
       }
       if (path === "/etc/resolv.conf") return "nameserver 10.0.0.53\n"
       if (path.endsWith("playwright-mcp-proxy-key")) return "wsl-proxy-token-fixture\n"
-      return "async doCreateNewPage() { background: true; focus: false }"
+      return 'async createTarget(url3) { this._sendToExtension("chrome.tabs.create", [{ url: url3, active: false }]) }'
     }
     dependencies.probeMcp = async () => ({ mcp: true, extension: true })
 
@@ -582,7 +594,7 @@ describe("PlaywrightBridge", () => {
       if (path === "/proc/net/route") return "eth0 00000000 not-an-ip"
       if (path === "/etc/resolv.conf") return "nameserver 10.0.0.53\n"
       if (path.endsWith("playwright-mcp-proxy-key")) return "wsl-proxy-token-fixture\n"
-      return "async doCreateNewPage() { background: true; focus: false }"
+      return 'async createTarget(url3) { this._sendToExtension("chrome.tabs.create", [{ url: url3, active: false }]) }'
     }
     dependencies.probeMcp = async () => ({ mcp: true, extension: true })
 
@@ -598,7 +610,7 @@ describe("PlaywrightBridge", () => {
     dependencies.readText = (path) => {
       if (path === "/proc/net/route" || path === "/etc/resolv.conf") throw new Error("missing")
       if (path.endsWith("playwright-mcp-proxy-key")) return "wsl-proxy-token-fixture\n"
-      return "async doCreateNewPage() { background: true; focus: false }"
+      return 'async createTarget(url3) { this._sendToExtension("chrome.tabs.create", [{ url: url3, active: false }]) }'
     }
     dependencies.probeMcp = async () => ({ mcp: true, extension: true })
 
@@ -970,7 +982,7 @@ describe("PlaywrightBridge", () => {
     const dependencies = fakeDependencies()
      dependencies.readText = (path) => path.endsWith("playwright-mcp-proxy-key")
       ? "proxy-token\n"
-      : "async doCreateNewPage() { background: true; focus: false }"
+      : 'async createTarget(url3) { this._sendToExtension("chrome.tabs.create", [{ url: url3, active: false }]) }'
     const bridge = new PlaywrightBridge(dependencies)
     expect((await bridge.start()).proxyRunning).toBe(true)
     expect(bridge.status().proxyEndpoint?.href).toBe("http://127.0.0.1:8932/mcp")
