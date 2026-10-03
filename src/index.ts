@@ -4,6 +4,7 @@ import { spawn, spawnSync } from "node:child_process"
 import { createRequire } from "node:module"
 import { homedir } from "node:os"
 import { dirname, isAbsolute, join } from "node:path"
+import { loadLocalConfig, LocalConfigError } from "./local-config"
 import {
   PlaywrightBridge,
   type BridgeConfig,
@@ -860,22 +861,23 @@ export async function installBridge(
 export default Plugin.define({
   id: "playwright-bridge",
   async setup(ctx) {
-    const configDir = configDirectory()
-    const config = bridgeConfigFromOptions(ctx.options, configDir)
     const log = createDiagnosticLogger()
-    if (sharedBridge === undefined) {
-      sharedBridge = createBridge(ctx.options)
-      if (process.platform !== "win32") {
-        try {
-          const configDir = configDirectory()
-          const tokenFile = bridgeConfigFromOptions(ctx.options, configDir).proxyTokenFile
-          sharedProxyToken = tokenFile === undefined ? undefined : readFileSync(tokenFile, "utf8").trim() || undefined
-        } catch {
-          sharedProxyToken = undefined
+    try {
+      const configDir = configDirectory()
+      loadLocalConfig(configDir)
+      const config = bridgeConfigFromOptions(ctx.options, configDir)
+      if (sharedBridge === undefined) {
+        sharedBridge = createBridge(ctx.options)
+        if (process.platform !== "win32") {
+          try {
+            const configDir = configDirectory()
+            const tokenFile = bridgeConfigFromOptions(ctx.options, configDir).proxyTokenFile
+            sharedProxyToken = tokenFile === undefined ? undefined : readFileSync(tokenFile, "utf8").trim() || undefined
+          } catch {
+            sharedProxyToken = undefined
+          }
         }
       }
-    }
-    try {
       const cleanup = await installBridge(ctx, sharedBridge, sharedProxyToken, log, {
         configDir,
         extensionTokenFile: config.extensionTokenFile!,
@@ -887,7 +889,10 @@ export default Plugin.define({
       })
       return cleanup
     } catch (error) {
-      if (typeof error !== "object" || error === null || !loggedSetupErrors.has(error)) {
+      if (error instanceof LocalConfigError) {
+        log(`Local config failed: ${error.message}`)
+        loggedSetupErrors.add(error)
+      } else if (typeof error !== "object" || error === null || !loggedSetupErrors.has(error)) {
         log(`Setup failed: ${diagnosticError(error)}`)
       }
       throw error

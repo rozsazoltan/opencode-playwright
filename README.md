@@ -19,6 +19,30 @@ Replace `<commit>` with the commit you want to install. A release tag can be use
 place of a commit hash, for example `#v0.1.0`. OpenCode loads the TypeScript entrypoint
 directly, so no build step or generated `dist/` directory is required.
 
+## Local plugin configuration
+
+During setup, the plugin reads `<OpenCode config>/opencode-playwright.json` and
+creates it with `{}` if missing. The file currently accepts only an empty JSON
+object: no comments, trailing commas, or configuration fields. Do not store tokens
+here. Existing plugin options and environment variables remain unchanged.
+
+The resolved config directory defaults to `%USERPROFILE%\.config\opencode` on
+Windows and `$HOME/.config/opencode` in WSL. Each platform uses its own native
+directory. `OPENCODE_CONFIG_DIR` overrides this default only if its directory contains
+`opencode.json`, `opencode.jsonc`, or `cli.json`; otherwise the native default applies.
+
+The plugin reads existing files without rewriting their contents. Invalid or
+unreadable files cause setup to fail but remain untouched. Diagnostics include the
+file path and a sanitized reason, never file contents. Correct the file or its
+permissions manually, then restart the affected platform's OpenCode service so
+setup reads it again. The plugin does not watch for changes. `/playwright-restart`
+restarts only the bridge; it does not reload this file.
+
+Automatic creation requires a filesystem that supports hard links. If creation
+fails, the plugin reports an error without an unsafe fallback. You can instead
+create the file with `{}` in an editor, then restart the affected OpenCode service.
+Reading an existing file does not require hard links.
+
 ## Browser extension and tokens
 
 Install the Playwright browser extension. Its upstream source is maintained in the
