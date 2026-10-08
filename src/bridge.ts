@@ -61,6 +61,7 @@ export type BridgeDependencies = {
   probeMcp(endpoint: URL, bearerToken?: string): Promise<{ mcp: boolean; extension: boolean }>
   now(): Date
   startProxy?(options: ProxyOptions): StartedProxy
+  getWslNetworkingMode?(): "nat" | "mirrored" | undefined
   /** Request the Windows owner to perform a lifecycle operation from WSL. */
   requestOwnerLifecycle?(action: OwnerLifecycleAction): Promise<void>
 }
@@ -185,8 +186,23 @@ function resolveConfig(
   const env = dependencies.env
   const configDir = overrides.configDir ?? env.OPENCODE_CONFIG_DIR ?? process.cwd()
   const wsl = isWsl(dependencies)
-  const windowsHost =
-    env.OPENCODE_PLAYWRIGHT_WINDOWS_HOST ?? (wsl ? wslGateway(dependencies) : undefined) ?? "127.0.0.1"
+  const explicitWindowsHost = env.OPENCODE_PLAYWRIGHT_WINDOWS_HOST
+  const needsAutomaticWindowsHost = wsl && explicitWindowsHost === undefined &&
+    !(overrides.endpoint !== undefined && overrides.proxyEndpoint !== undefined)
+  let networkingMode: "nat" | "mirrored" | undefined
+  if (needsAutomaticWindowsHost) {
+    try {
+      networkingMode = dependencies.getWslNetworkingMode?.()
+    } catch {
+      // An unavailable mode detector preserves legacy NAT host discovery.
+    }
+  }
+  const automaticWindowsHost = needsAutomaticWindowsHost
+    ? networkingMode === "mirrored"
+      ? "127.0.0.1"
+      : wslGateway(dependencies)
+    : undefined
+  const windowsHost = explicitWindowsHost ?? automaticWindowsHost ?? "127.0.0.1"
   const playwrightHost = loopbackHost(overrides.playwrightHost ?? env.OPENCODE_PLAYWRIGHT_HOST)
   const playwrightPort = overrides.playwrightPort ?? integer(env.OPENCODE_PLAYWRIGHT_PORT, 8931)
   const proxyHost = overrides.proxyHost ?? env.OPENCODE_PLAYWRIGHT_PROXY_HOST ?? "0.0.0.0"

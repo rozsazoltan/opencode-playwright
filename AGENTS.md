@@ -25,9 +25,16 @@ Update `README.md` when user-facing behavior or setup changes.
 
 Preserve graceful startup, shutdown, and cleanup. Keep MCP bound to loopback.
 Preserve authentication and secret redaction; never expose tokens in logs or documentation.
-The proxy requires bearer authentication and WSL NAT source-subnet checks.
-Fail closed when the subnet cannot be verified. Subnet matching does not establish
-WSL process identity or full network isolation.
+The proxy requires bearer authentication for every admitted peer. Strictly parse
+socket peer addresses; admit only loopback peers or non-loopback IPv4 peers within
+currently discovered, fully validated WSL vEthernet NAT CIDRs. Never trust forwarding
+headers. Deny unknown or malformed peers. Fail closed for non-loopback peers when
+NAT discovery is missing, fails, or returns invalid CIDRs; preserve startup and
+authenticated loopback access without NAT discovery. These checks admit local
+Windows and WSL processes; they do not establish WSL process identity or full network
+isolation. Mirrored WSL can reach an IPv4-loopback MCP listener directly; proxy
+authentication does not protect direct MCP connections. Do not change user
+networking or firewall settings or add port forwarding.
 
 ## Playwright focus patch
 

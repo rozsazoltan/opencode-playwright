@@ -2,8 +2,10 @@ import { afterEach, describe, expect, test } from "bun:test"
 import { createConnection } from "node:net"
 import {
   createProxyHandler,
+  createProxyFetchHandler,
   discoverWslNatCidrs,
   isAllowedClientAddress,
+  isLoopbackClientAddress,
   startProxy,
 } from "../src/proxy"
 
@@ -98,90 +100,178 @@ describe("Playwright proxy", () => {
     expect(isAllowedClientAddress("192.0.2.1", ["192.0.2.1/0"])).toBe(false)
   })
 
-  test("startProxy fails closed when configured client CIDRs are absent or invalid", () => {
+  test("strictly recognizes IPv4, dotted IPv4-mapped, and exact IPv6 loopback peers", () => {
+    for (const address of [
+      "127.0.0.1",
+      "127.255.255.255",
+      "::ffff:127.0.0.1",
+      "::FFFF:127.0.0.1",
+      "::1",
+    ]) {
+      expect(isLoopbackClientAddress(address)).toBe(true)
+    }
+
+    for (const address of [
+      null,
+      "127.0.0.256",
+      "127.00.0.1",
+      " 127.0.0.1",
+      "::ffff:127.00.0.1",
+      "0:0:0:0:0:0:0:1",
+      "::ffff:7f00:1",
+      "::ffff:192.0.2.1",
+    ]) {
+      expect(isLoopbackClientAddress(address)).toBe(false)
+    }
+  })
+
+  test("startProxy rejects invalid explicit client CIDRs but accepts an empty override", async () => {
     const options = {
       hostname: "127.0.0.1",
       port: 0,
       targetOrigin: new URL("http://127.0.0.1:1"),
       bearerToken: "correct-token",
     }
-    expect(() => startProxy({ ...options, allowedClientCidrs: [] })).toThrow()
+    const emptyOverride = createProxyFetchHandler({ ...options, allowedClientCidrs: [] })
+    expect(
+      (
+        await emptyOverride(
+          new Request("http://proxy.test/mcp", {
+            headers: { authorization: "Bearer correct-token" },
+          }),
+          "192.0.2.45",
+        )
+      ).status,
+    ).toBe(403)
     expect(() => startProxy({ ...options, allowedClientCidrs: ["192.0.2.0/33"] })).toThrow()
     expect(() => startProxy({ ...options, allowedClientCidrs: ["0.0.0.0/0"] })).toThrow()
     expect(() => startProxy({ ...options, allowedClientCidrs: ["192.0.2.1/0"] })).toThrow()
   })
 
-  test("refreshes discovered CIDRs per request and denies requests when discovery disappears", async () => {
+  test("refreshes discovered CIDRs per remote request and rejects empty, throwing, or malformed discovery", async () => {
     const { targetOrigin, upstreamRequests } = createTestProxy("correct-token")
     let discoveryCalls = 0
-    const proxy = startProxy({
+    const fetchProxy = createProxyFetchHandler({
       hostname: "127.0.0.1",
       port: 0,
       targetOrigin,
       bearerToken: "correct-token",
       discoverClientCidrs: () => {
         discoveryCalls++
-        if (discoveryCalls === 1) return ["127.0.0.1/32"]
-        if (discoveryCalls === 2) return ["192.0.2.0/24"]
-        return []
+        if (discoveryCalls === 1) return ["192.0.2.0/24"]
+        if (discoveryCalls === 2) return ["198.51.100.0/24"]
+        if (discoveryCalls === 3) return ["198.51.100.0/24"]
+        if (discoveryCalls === 4) return []
+        if (discoveryCalls === 5) throw new Error("discovery unavailable")
+        return ["198.51.100.0/24", "invalid"]
       },
     })
+    const request = (address: string | null) =>
+      fetchProxy(
+        new Request("http://proxy.test/mcp", {
+          headers: { authorization: "Bearer correct-token" },
+        }),
+        address,
+      )
 
-    try {
-      const response = await fetch(proxy.url, {
-        headers: { authorization: "Bearer correct-token" },
-      })
-      expect(response.status).toBe(403)
-      expect(upstreamRequests()).toBe(0)
+    expect(discoveryCalls).toBe(0)
+    const initiallyAllowed = await request("192.0.2.45")
+    expect(initiallyAllowed.status).toBe(200)
+    expect(await initiallyAllowed.text()).toBe("upstream-stream")
 
-      const disappeared = await fetch(proxy.url, {
-        headers: { authorization: "Bearer correct-token" },
-      })
-      expect(disappeared.status).toBe(403)
-      expect(upstreamRequests()).toBe(0)
-      expect(discoveryCalls).toBe(3)
-    } finally {
-      proxy.stop(true)
+    expect((await request("192.0.2.45")).status).toBe(403)
+    const replacementAllowed = await request("198.51.100.45")
+    expect(replacementAllowed.status).toBe(200)
+    expect(await replacementAllowed.text()).toBe("upstream-stream")
+    for (const address of ["198.51.100.45", "198.51.100.45", "198.51.100.45"]) {
+      expect((await request(address)).status).toBe(403)
     }
+    expect(discoveryCalls).toBe(6)
+    expect(upstreamRequests()).toBe(2)
   })
 
-  test("startProxy rejects clients outside its configured subnet before forwarding", async () => {
+  test("rejects null, malformed, and out-of-subnet socket peers before forwarding", async () => {
     const { targetOrigin, upstreamRequests } = createTestProxy("correct-token")
-    const rejectedProxy = startProxy({
+    const fetchProxy = createProxyFetchHandler({
       hostname: "127.0.0.1",
       port: 0,
       targetOrigin,
       bearerToken: "correct-token",
       allowedClientCidrs: ["192.0.2.0/24"],
     })
+    const request = (
+      address: string | null,
+      headers: Record<string, string> = {},
+      url = "http://proxy.test/mcp",
+    ) =>
+      fetchProxy(
+        new Request(url, {
+          headers: { authorization: "Bearer correct-token", ...headers },
+        }),
+        address,
+      )
 
-    try {
-      const rejected = await fetch(rejectedProxy.url, {
-        headers: { authorization: "Bearer correct-token" },
-      })
+    for (const address of [null, "not-an-ip", "192.0.2.999", "198.51.100.45"]) {
+      const rejected = await request(address, {
+        host: "192.0.2.45",
+        forwarded: "for=192.0.2.45",
+        "x-forwarded-for": "192.0.2.45",
+        "x-real-ip": "192.0.2.45",
+      }, "http://192.0.2.45/mcp")
       expect(rejected.status).toBe(403)
       expect(await rejected.text()).toBe("Forbidden")
-      expect(upstreamRequests()).toBe(0)
-    } finally {
-      rejectedProxy.stop(true)
     }
 
-    const allowedProxy = startProxy({
-      hostname: "127.0.0.1",
-      port: 0,
-      targetOrigin,
-      bearerToken: "correct-token",
-      allowedClientCidrs: ["127.0.0.1/32"],
-    })
-    try {
-      const allowed = await fetch(allowedProxy.url, {
-        headers: { authorization: "Bearer correct-token" },
+    const allowed = await request("192.0.2.45")
+    expect(allowed.status).toBe(200)
+    expect(await allowed.text()).toBe("upstream-stream")
+    expect(upstreamRequests()).toBe(1)
+  })
+
+  test("keeps local clients authenticated when NAT discovery is absent, empty, or throws", async () => {
+    const discoveryModes: Array<(() => string[]) | undefined> = [
+      undefined,
+      () => [],
+      () => {
+        throw new Error("discovery unavailable")
+      },
+    ]
+
+    for (const discoverClientCidrs of discoveryModes) {
+      const { targetOrigin, upstreamRequests } = createTestProxy("correct-token")
+      let discoveryCalls = 0
+      const proxy = startProxy({
+        hostname: "127.0.0.1",
+        port: 0,
+        targetOrigin,
+        bearerToken: "correct-token",
+        ...(discoverClientCidrs && {
+          discoverClientCidrs: () => {
+            discoveryCalls++
+            return discoverClientCidrs()
+          },
+        }),
       })
-      expect(allowed.status).toBe(200)
-      expect(await allowed.text()).toBe("upstream-stream")
-      expect(upstreamRequests()).toBe(1)
-    } finally {
-      allowedProxy.stop(true)
+
+      try {
+        expect((await fetch(proxy.url)).status).toBe(401)
+        expect(
+          (
+            await fetch(proxy.url, {
+              headers: { authorization: "Bearer wrong-token" },
+            })
+          ).status,
+        ).toBe(401)
+        const authorized = await fetch(proxy.url, {
+          headers: { authorization: "Bearer correct-token" },
+        })
+        expect(authorized.status).toBe(200)
+        expect(await authorized.text()).toBe("upstream-stream")
+        expect(upstreamRequests()).toBe(1)
+        expect(discoveryCalls).toBe(0)
+      } finally {
+        proxy.stop(true)
+      }
     }
   })
 

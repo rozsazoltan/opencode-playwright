@@ -100,10 +100,18 @@ export function isAllowedClientAddress(address: string | null, cidrs: readonly s
 }
 
 function validateClientCidrs(cidrs: readonly string[]): Ipv4Cidr[] {
-  if (cidrs.length === 0) throw new Error("No WSL NAT client subnets could be detected")
   const parsed = cidrs.map(parseCidr)
   if (parsed.some((cidr) => cidr === null)) throw new Error("Invalid allowed client CIDR")
   return parsed as Ipv4Cidr[]
+}
+
+export function isLoopbackClientAddress(address: string | null): boolean {
+  if (address === null) return false
+  if (address === "::1") return true
+
+  const mappedIpv4 = /^::ffff:(.+)$/i.exec(address)?.[1] ?? address
+  const parsed = parseIpv4(mappedIpv4)
+  return parsed !== null && parsed[0] === 127
 }
 
 function copiedHeaders(headers: Headers, excluded: ReadonlySet<string> = new Set()): Headers {
@@ -196,30 +204,55 @@ export function createProxyHandler(
   return (request) => handler(request)
 }
 
-export function startProxy(options: ProxyOptions): StartedProxy {
+/** Creates Bun's fetch callback. clientAddress comes from the accepted socket, never request headers. */
+export function createProxyFetchHandler(
+  options: ProxyOptions,
+): (
+  request: Request,
+  clientAddress: string | null,
+  acceptMcpStream?: (request: Request) => void,
+) => Promise<Response> {
+  const handler = createProxyHandlerInternal(options)
   const discovery = options.discoverClientCidrs ?? discoverWslNatCidrs
-  const allowedClientCidrs = options.allowedClientCidrs ?? discovery()
-  validateClientCidrs(allowedClientCidrs)
-  const resolveClientCidrs = options.allowedClientCidrs
-    ? () => options.allowedClientCidrs!
-    : discovery
+  const explicitClientCidrs = options.allowedClientCidrs?.slice()
+  if (explicitClientCidrs !== undefined) validateClientCidrs(explicitClientCidrs)
+
+  return async (request, clientAddress, acceptMcpStream) => {
+    if (!isLoopbackClientAddress(clientAddress)) {
+      let clientCidrs: string[]
+      try {
+        clientCidrs = explicitClientCidrs ?? discovery()
+        validateClientCidrs(clientCidrs)
+        if (clientCidrs.length === 0 || !isAllowedClientAddress(clientAddress, clientCidrs)) {
+          return new Response("Forbidden", { status: 403 })
+        }
+      } catch {
+        return new Response("Forbidden", { status: 403 })
+      }
+    }
+
+    return handler(request, acceptMcpStream)
+  }
+}
+
+export function startProxy(options: ProxyOptions): StartedProxy {
+  const fetchHandler = createProxyFetchHandler(options)
   const server = Bun.serve({
     hostname: options.hostname,
     port: options.port,
     idleTimeout: 10,
     http2: false,
     fetch(request, server) {
-      let requestCidrs: string[]
+      let clientAddress: string | null = null
       try {
-        requestCidrs = resolveClientCidrs()
-        validateClientCidrs(requestCidrs)
+        clientAddress = server.requestIP(request)?.address ?? null
       } catch {
-        return new Response("Forbidden", { status: 403 })
+        // A failed peer lookup must not grant access.
       }
-      return createProxyHandlerInternal(options, requestCidrs)(
+      return fetchHandler(
         request,
+        clientAddress,
         (acceptedRequest) => server.timeout(acceptedRequest, 0),
-        server.requestIP(request)?.address,
       )
     },
   })

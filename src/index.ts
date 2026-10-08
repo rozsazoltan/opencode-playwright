@@ -250,6 +250,49 @@ export function resolveNodeExecutable(
 
 const MCP_PROBE_TIMEOUT_MS = 1_000
 const MCP_PROTOCOL_VERSION = "2025-03-26"
+const WSL_NETWORKING_MODE_TIMEOUT_MS = 1_000
+const WSL_NETWORKING_MODE_MAX_BUFFER_BYTES = 1_024
+
+type WslNetworkingModeCommandOptions = {
+  encoding: "utf8"
+  timeout: number
+  maxBuffer: number
+  windowsHide: true
+  stdio: ["ignore", "pipe", "pipe"]
+}
+
+type WslNetworkingModeCommandResult = {
+  status: number | null
+  stdout?: string | null
+  stderr?: string | null
+  error?: unknown
+}
+
+type WslNetworkingModeExecutor = (
+  command: "wslinfo",
+  args: ["--networking-mode"],
+  options: WslNetworkingModeCommandOptions,
+) => WslNetworkingModeCommandResult
+
+export function detectWslNetworkingMode(
+  execute: WslNetworkingModeExecutor = (command, args, options) => spawnSync(command, args, options),
+): "nat" | "mirrored" | undefined {
+  try {
+    const result = execute("wslinfo", ["--networking-mode"], {
+      encoding: "utf8",
+      timeout: WSL_NETWORKING_MODE_TIMEOUT_MS,
+      maxBuffer: WSL_NETWORKING_MODE_MAX_BUFFER_BYTES,
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    })
+    if (result.error !== undefined || result.status !== 0) return undefined
+
+    const mode = result.stdout?.trim()
+    return mode === "nat" || mode === "mirrored" ? mode : undefined
+  } catch {
+    return undefined
+  }
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null
@@ -452,6 +495,7 @@ export function createBridge(options: PluginOptions = {}): PlaywrightBridge {
     },
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     probeMcp,
+    getWslNetworkingMode: detectWslNetworkingMode,
     requestOwnerLifecycle:
       typeof options.ownerLifecycleRequest === "function"
         ? (options.ownerLifecycleRequest as OwnerLifecycleRequester)

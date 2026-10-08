@@ -119,11 +119,11 @@ environment override is set.
 | `OPENCODE_PLAYWRIGHT_EXTENSION_TOKEN` | Unset; reads the extension key file instead | Extension key passed privately to the Playwright MCP child process. Set on the Windows OpenCode service only. |
 | `OPENCODE_PLAYWRIGHT_EXTENSION_TOKEN_FILE` | `.secrets/playwright-key` | Path to the extension key file. Ignored when the direct token environment variable is set. |
 | `OPENCODE_PLAYWRIGHT_PROXY_TOKEN_FILE` | `.secrets/playwright-mcp-proxy-key` | Path to the proxy bearer token file; same token must be present on Windows and WSL. |
-| `OPENCODE_PLAYWRIGHT_HOST` | `localhost` | Loopback host for the Windows Playwright MCP server. Non-loopback values are restricted to `127.0.0.1`. |
+| `OPENCODE_PLAYWRIGHT_HOST` | `localhost` | Loopback host for the Windows Playwright MCP server. Non-loopback values fall back to `127.0.0.1`. |
 | `OPENCODE_PLAYWRIGHT_PORT` | `8931` | MCP server port, bound to loopback on Windows. |
-| `OPENCODE_PLAYWRIGHT_PROXY_HOST` | `0.0.0.0` | Bind address for the proxy that WSL connects to. Source-IP checks allow only addresses in the currently discovered WSL vEthernet NAT subnet. |
+| `OPENCODE_PLAYWRIGHT_PROXY_HOST` | `0.0.0.0` | Proxy bind address. Socket-peer checks admit loopback peers or IPv4 peers in currently discovered, fully validated WSL vEthernet NAT CIDRs; bearer authentication remains mandatory. |
 | `OPENCODE_PLAYWRIGHT_PROXY_PORT` | `8932` | Authenticated proxy port used by WSL. |
-| `OPENCODE_PLAYWRIGHT_WINDOWS_HOST` | Auto-detected from WSL routing/DNS; fallback `127.0.0.1` | Windows host address WSL uses to reach the MCP proxy. |
+| `OPENCODE_PLAYWRIGHT_WINDOWS_HOST` | `127.0.0.1` in detected mirrored mode; otherwise gateway, DNS, then `127.0.0.1` | Windows host address WSL uses to reach the MCP proxy. An explicit value overrides automatic detection. |
 | `OPENCODE_PLAYWRIGHT_EXECUTABLE_PATH` | `C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe` | Brave executable path. |
 | `OPENCODE_PLAYWRIGHT_PROFILE_DIR_NAME` | `Default` | Brave profile directory used by Playwright. |
 | `OPENCODE_PLAYWRIGHT_STARTUP_TIMEOUT_MS` | `15000` | Maximum time to wait for MCP readiness. |
@@ -136,23 +136,41 @@ environment override is set.
 
 Port `8931` is the local Playwright MCP server launched beside Brave on Windows.
 Port `8932` is a separate authenticated proxy that WSL can reach; it forwards
-requests to the local MCP server and requires the shared proxy token. Keeping the
-MCP server on loopback avoids exposing it directly to WSL or the network, while the
-proxy provides the controlled cross-WSL connection. The two ports must be distinct.
+requests to the local MCP server and requires the shared proxy token. The two ports
+must be distinct. Loopback binding keeps MCP off network-facing interfaces, but
+mirrored WSL can also reach an IPv4-loopback MCP listener directly. The proxy does
+not add bearer authentication to direct connections to MCP port `8931`; its token
+protects only proxy port `8932`.
 
-The proxy continues to bind to `0.0.0.0`, but checks each connection's source IP
-against the currently discovered WSL `vEthernet` NAT subnet and fails closed when
-that subnet cannot be discovered. This is a source-subnet check, not WSL process
-identity or full network isolation: the proxy does not verify the incoming network
-interface, and any client whose source address is in the same subnet can match.
+The proxy binds to `0.0.0.0` by default. It strictly parses each socket peer address
+and admits only loopback peers or non-loopback IPv4 peers within the currently
+discovered, fully validated WSL `vEthernet` NAT CIDRs. It never trusts forwarding
+headers. Unknown or malformed peers are denied. NAT discovery is not required for
+startup or authenticated loopback access; non-loopback peers are denied when
+discovery is missing, fails, or returns invalid CIDRs. Every admitted peer still
+requires the proxy bearer token.
+
+Authenticated local Windows and WSL processes can use the proxy. Source checks do
+not establish WSL process identity or full network isolation: the proxy does not
+verify the incoming network interface, and any client whose source address falls
+within an allowed NAT CIDR can match.
 Windows may still show an OS firewall warning because the proxy binds on all
 interfaces; the plugin does not change firewall settings. Do not add port forwarding
-or expose the proxy port beyond the trusted host/network. The proxy bearer token
-remains mandatory in addition to the source-IP check.
+or expose the proxy port beyond the trusted host/network.
 
-This access model relies on WSL NAT networking. Mirrored networking and WSL
-localhost/loopback access may not present a source address in the discovered NAT
-subnet and are not supported by this subnet check.
+### WSL host detection
+
+For automatic WSL host detection, the plugin runs `wslinfo --networking-mode` with
+a bounded timeout. Detected mirrored mode uses IPv4 `127.0.0.1`, not `::1`. For NAT,
+an unknown mode, or unavailable `wslinfo`, it tries the routing gateway, then the
+nameserver in `/etc/resolv.conf`, then `127.0.0.1`. Explicit
+`OPENCODE_PLAYWRIGHT_WINDOWS_HOST` and endpoint overrides take precedence.
+
+If older WSL lacks `wslinfo` but uses mirrored networking, set
+`OPENCODE_PLAYWRIGHT_WINDOWS_HOST=127.0.0.1` in the WSL OpenCode service environment.
+You do not need to change your WSL networking mode or `hostAddressLoopback` setting.
+Microsoft documents [mirrored IPv4 localhost access](https://learn.microsoft.com/windows/wsl/networking#mirrored-mode-networking)
+and confirms that [`hostAddressLoopback=true` is not required for `127.0.0.1`](https://learn.microsoft.com/windows/wsl/wsl-config#experimental-settings).
 
 ## Logs
 

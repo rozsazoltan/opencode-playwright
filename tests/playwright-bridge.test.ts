@@ -7,6 +7,7 @@ import {
   configDirectory,
   createBridge,
   createDiagnosticLogger,
+  detectWslNetworkingMode,
   diagnosticLogPath,
   installBridge,
   probeMcp,
@@ -402,6 +403,49 @@ describe("MCP readiness probe", () => {
     },
     1_500,
   )
+})
+
+describe("WSL networking mode detection", () => {
+  test("runs bounded wslinfo command and accepts only exact known modes", () => {
+    let invocation: unknown[] = []
+    const mode = detectWslNetworkingMode((command, args, options) => {
+      invocation = [command, args, options]
+      return { status: 0, stdout: " mirrored \n", stderr: "ignored diagnostic" }
+    })
+
+    expect(mode).toBe("mirrored")
+    expect(invocation).toEqual([
+      "wslinfo",
+      ["--networking-mode"],
+      {
+        encoding: "utf8",
+        timeout: 1_000,
+        maxBuffer: 1_024,
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    ])
+    expect(detectWslNetworkingMode(() => ({ status: 0, stdout: "nat\n" }))).toBe("nat")
+  })
+
+  test("returns undefined for unknown, malformed, failed, timed-out, or throwing execution", () => {
+    const outcomes: Array<{ status: number | null; stdout?: string | null; error?: unknown }> = [
+      { status: 0, stdout: "unknown" },
+      { status: 0, stdout: "NAT" },
+      { status: 0, stdout: "nat\nmirrored" },
+      { status: 0, stdout: "" },
+      { status: 127, stdout: "nat" },
+      { status: null, error: Object.assign(new Error("missing executable"), { code: "ENOENT" }) },
+      { status: null, error: Object.assign(new Error("timed out"), { code: "ETIMEDOUT" }) },
+    ]
+
+    for (const outcome of outcomes) {
+      expect(detectWslNetworkingMode(() => outcome)).toBeUndefined()
+    }
+    expect(detectWslNetworkingMode(() => {
+      throw new Error("executor failure")
+    })).toBeUndefined()
+  })
 })
 
 describe("bridge port detection", () => {
@@ -939,6 +983,117 @@ describe("PlaywrightBridge", () => {
     expect(status.proxyEndpoint?.href).toBe("http://172.20.0.1:9342/mcp")
     expect(status.proxyRunning).toBe(true)
     expect(probeToken).toBe("wsl-proxy-token-fixture")
+  })
+
+  test("WSL mirrored networking selects IPv4 loopback without reading route or DNS", () => {
+    const dependencies = fakeDependencies()
+    dependencies.platform = "linux"
+    dependencies.env = { WSL_DISTRO_NAME: "Ubuntu" }
+    let modeChecks = 0
+    const hostReads: string[] = []
+    dependencies.getWslNetworkingMode = () => {
+      modeChecks++
+      return "mirrored"
+    }
+    dependencies.readText = (path) => {
+      hostReads.push(path)
+      throw new Error("host discovery must not read files")
+    }
+
+    const status = new PlaywrightBridge(dependencies).status()
+
+    expect(modeChecks).toBe(1)
+    expect(hostReads).toEqual([])
+    expect(status.endpoint.href).toBe("http://127.0.0.1:8931/mcp")
+    expect(status.proxyEndpoint?.href).toBe("http://127.0.0.1:8932/mcp")
+  })
+
+  test("WSL NAT and unknown modes keep gateway-first host discovery", () => {
+    for (const mode of ["nat", undefined] as const) {
+      const dependencies = fakeDependencies()
+      dependencies.platform = "linux"
+      dependencies.env = { WSL_DISTRO_NAME: "Ubuntu" }
+      const reads: string[] = []
+      let modeChecks = 0
+      dependencies.getWslNetworkingMode = () => {
+        modeChecks++
+        return mode
+      }
+      dependencies.readText = (path) => {
+        reads.push(path)
+        if (path === "/proc/net/route") {
+          return "Iface Destination Gateway Flags\neth0 00000000 010011AC 0003\n"
+        }
+        if (path === "/etc/resolv.conf") return "nameserver 10.0.0.53\n"
+        return patchedBundle
+      }
+
+      const status = new PlaywrightBridge(dependencies).status()
+
+      expect(modeChecks).toBe(1)
+      expect(reads).toEqual(["/proc/net/route"])
+      expect(status.endpoint.href).toBe("http://172.17.0.1:8931/mcp")
+      expect(status.proxyEndpoint?.href).toBe("http://172.17.0.1:8932/mcp")
+    }
+  })
+
+  test("skips networking-mode and route discovery when platform or explicit hosts make it unnecessary", () => {
+    const scenarios = [
+      { platform: "win32" as const, env: {} },
+      { platform: "linux" as const, env: {} },
+      {
+        platform: "linux" as const,
+        env: { WSL_DISTRO_NAME: "Ubuntu", OPENCODE_PLAYWRIGHT_WINDOWS_HOST: "172.20.0.1" },
+      },
+    ]
+
+    for (const scenario of scenarios) {
+      const dependencies = fakeDependencies()
+      dependencies.platform = scenario.platform
+      dependencies.env = scenario.env
+      let modeChecks = 0
+      const reads: string[] = []
+      dependencies.getWslNetworkingMode = () => {
+        modeChecks++
+        return "mirrored"
+      }
+      dependencies.readText = (path) => {
+        reads.push(path)
+        throw new Error("route discovery must not run")
+      }
+
+      const status = new PlaywrightBridge(dependencies).status()
+
+      expect(modeChecks).toBe(0)
+      expect(reads).toEqual([])
+      if (scenario.env.OPENCODE_PLAYWRIGHT_WINDOWS_HOST !== undefined) {
+        expect(status.endpoint.href).toBe("http://172.20.0.1:8931/mcp")
+        expect(status.proxyEndpoint?.href).toBe("http://172.20.0.1:8932/mcp")
+      }
+    }
+  })
+
+  test("skips automatic host detection when both WSL endpoints are explicit", () => {
+    const dependencies = fakeDependencies()
+    dependencies.platform = "linux"
+    dependencies.env = { WSL_DISTRO_NAME: "Ubuntu" }
+    let modeChecks = 0
+    dependencies.getWslNetworkingMode = () => {
+      modeChecks++
+      return "mirrored"
+    }
+    dependencies.readText = () => {
+      throw new Error("host discovery must not run")
+    }
+
+    const status = new PlaywrightBridge(dependencies, {
+      endpoint: new URL("http://192.0.2.10:8931/mcp"),
+      proxyEndpoint: new URL("http://192.0.2.11:8932/mcp"),
+    }).status()
+
+    expect(modeChecks).toBe(0)
+    expect(status.endpoint.href).toBe("http://192.0.2.10:8931/mcp")
+    expect(status.proxyEndpoint?.href).toBe("http://192.0.2.11:8932/mcp")
   })
 
   test("WSL prefers the default route gateway over the resolv.conf nameserver", async () => {
