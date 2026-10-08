@@ -3,7 +3,11 @@ import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { PlaywrightBridge, type BridgeDependencies } from "../src/bridge"
-import { installBridge } from "../src/index"
+import {
+  installBridge,
+  requestWindowsOwnerLifecycle,
+  type WindowsOwnerLifecycleExecutor,
+} from "../src/index"
 
 const temporaryDirectories = new Set<string>()
 
@@ -150,6 +154,29 @@ describe("WSL owner lifecycle fast path", () => {
     expect(status.reason).toBe("Windows Playwright owner request failed")
     expect(lifecycleRequests).toEqual(["start"])
     expect(probes).toHaveLength(2)
+  })
+
+  test("bounds Windows owner requests and routes timeout through controlled failure", async () => {
+    let processTimeout: number | undefined
+    let script = ""
+    const executor: WindowsOwnerLifecycleExecutor = (_command, args, options) => {
+      processTimeout = options.timeout
+      script = Buffer.from(args[3] ?? "", "base64").toString("utf16le")
+      return { status: null, error: new Error("private timeout detail") }
+    }
+    const { bridge, lifecycleRequests } = wslBridge({
+      request: async (action) => requestWindowsOwnerLifecycle(action, {}, "/unused", executor),
+    })
+
+    const status = await bridge.start()
+
+    expect(processTimeout).toBe(25_000)
+    expect(script.match(/-TimeoutSec 10/g)).toHaveLength(2)
+    expect(script).toContain("Authorization = 'Basic '")
+    expect(status.state).toBe("failed")
+    expect(status.reason).toBe("Windows Playwright owner request failed")
+    expect(status.reason).not.toContain("private timeout detail")
+    expect(lifecycleRequests).toEqual(["start"])
   })
 
   test("requests the Windows owner when the proxy is not ready", async () => {

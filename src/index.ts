@@ -31,6 +31,26 @@ type PluginOptions = Readonly<Record<string, unknown>>
 type OwnerLifecycleRequester = (action: OwnerLifecycleAction) => Promise<void>
 type DiagnosticLogger = (message: string) => void
 
+const WINDOWS_OWNER_HTTP_TIMEOUT_SECONDS = 10
+const WINDOWS_OWNER_PROCESS_TIMEOUT_MS = 25_000
+
+type WindowsOwnerLifecycleCommandOptions = {
+  timeout: number
+  windowsHide: true
+  stdio: "ignore"
+}
+
+type WindowsOwnerLifecycleCommandResult = {
+  status: number | null
+  error?: unknown
+}
+
+export type WindowsOwnerLifecycleExecutor = (
+  command: "powershell.exe",
+  args: string[],
+  options: WindowsOwnerLifecycleCommandOptions,
+) => WindowsOwnerLifecycleCommandResult
+
 const TOOL_SELECTION_GUIDANCE = [
   "Tool selection guidance:",
   "- GitHub MCP is the first choice for GitHub repositories, issues, pull requests, and releases.",
@@ -91,10 +111,11 @@ function diagnosticError(error: unknown): string {
   return error instanceof Error ? "unexpected error" : "unknown error"
 }
 
-function requestWindowsOwnerLifecycle(
+export function requestWindowsOwnerLifecycle(
   action: OwnerLifecycleAction,
   env: NodeJS.ProcessEnv,
   configDir: string,
+  execute: WindowsOwnerLifecycleExecutor = (command, args, options) => spawnSync(command, args, options),
 ): void {
   const serviceUrl = env.OPENCODE_PLAYWRIGHT_WINDOWS_SERVICE_URL ?? "http://127.0.0.1:49374"
   let password = env.OPENCODE_SERVER_PASSWORD
@@ -111,19 +132,27 @@ function requestWindowsOwnerLifecycle(
     `$base = '${serviceUrl.replace(/'/g, "''")}'`,
     `$password = '${escapedPassword}'`,
     "$headers = if ($password.Length -gt 0) { @{ Authorization = 'Basic ' + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes('opencode:' + $password)) } } else { @{} }",
-    "$active = Invoke-RestMethod -Method Get -Uri ($base + '/api/session/active') -Headers $headers",
+    `$active = Invoke-RestMethod -Method Get -Uri ($base + '/api/session/active') -Headers $headers -TimeoutSec ${WINDOWS_OWNER_HTTP_TIMEOUT_SECONDS}`,
     "$sessionProperty = if ($null -ne $active.data) { $active.data.PSObject.Properties | Select-Object -First 1 } else { $null }",
     "$sessionId = if ($null -ne $sessionProperty) { $sessionProperty.Name } elseif ($null -ne $active.id) { $active.id } else { $null }",
     "if ([string]::IsNullOrEmpty($sessionId)) { throw 'No active Windows OpenCode session' }",
     `$body = @{ name = 'playwright-${action}'; text = '' } | ConvertTo-Json -Compress`,
-    "Invoke-RestMethod -Method Post -Uri ($base + '/api/session/' + $sessionId + '/command') -Headers $headers -ContentType 'application/json' -Body $body | Out-Null",
+    `Invoke-RestMethod -Method Post -Uri ($base + '/api/session/' + $sessionId + '/command') -Headers $headers -ContentType 'application/json' -Body $body -TimeoutSec ${WINDOWS_OWNER_HTTP_TIMEOUT_SECONDS} | Out-Null`,
   ].join("; ")
   const encoded = Buffer.from(script, "utf16le").toString("base64")
-  const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", encoded], {
-    windowsHide: true,
-    stdio: "ignore",
-  })
-  if (result.status !== 0) throw new Error("Windows Playwright owner request failed")
+  let result: WindowsOwnerLifecycleCommandResult
+  try {
+    result = execute("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", encoded], {
+      timeout: WINDOWS_OWNER_PROCESS_TIMEOUT_MS,
+      windowsHide: true,
+      stdio: "ignore",
+    })
+  } catch {
+    throw new Error("Windows Playwright owner request failed")
+  }
+  if (result.error !== undefined || result.status !== 0) {
+    throw new Error("Windows Playwright owner request failed")
+  }
 }
 
 export function configDirectory(
