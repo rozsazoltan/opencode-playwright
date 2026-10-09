@@ -19,6 +19,33 @@ Replace `<commit>` with the commit you want to install. A release tag can be use
 place of a commit hash, for example `#v0.1.0`. OpenCode loads the TypeScript entrypoint
 directly, so no build step or generated `dist/` directory is required.
 
+## Local plugin configuration
+
+During setup, the plugin reads `<OpenCode config>/opencode-playwright.json` and
+creates it with `{}` if missing. The file accepts strict JSON with the documented
+flat camelCase settings below; comments and trailing commas are not supported.
+Setting precedence is explicit plugin option, local JSON setting, environment
+variable, then default. Environment variables remain supported as fallbacks. Do not
+store token values or passwords here; secret inputs remain environment variables or
+protected service/token files.
+
+The resolved config directory defaults to `%USERPROFILE%\.config\opencode` on
+Windows and `$HOME/.config/opencode` in WSL. Each platform uses its own native
+directory. `OPENCODE_CONFIG_DIR` overrides this default only if its directory contains
+`opencode.json`, `opencode.jsonc`, or `cli.json`; otherwise the native default applies.
+
+The plugin reads existing files without rewriting their contents. Invalid or
+unreadable files cause setup to fail but remain untouched. Diagnostics include the
+file path and a sanitized reason, never file contents. Correct the file or its
+permissions manually, then restart the affected platform's OpenCode service so
+setup reads it again. The plugin does not watch for changes. `/playwright-restart`
+restarts only the bridge; it does not reload this file.
+
+Automatic creation requires a filesystem that supports hard links. If creation
+fails, the plugin reports an error without an unsafe fallback. You can instead
+create the file with `{}` in an editor, then restart the affected OpenCode service.
+Reading an existing file does not require hard links.
+
 ## Browser extension and tokens
 
 Install the Playwright browser extension. Its upstream source is maintained in the
@@ -83,11 +110,51 @@ actual browser state, and when Jina/webfetch returns 403 or a bot/CAPTCHA challe
 Do not try to bypass a challenge: ask the user to complete it in their browser, then
 continue by inspecting the current Playwright page.
 
-## Configuration environment variables
+## Plugin settings and environment variables
 
-All entries are optional unless noted. File paths may be absolute or relative to
-the OpenCode config directory. The defaults below apply when no plugin option or
-environment override is set.
+All settings are optional unless noted. Put non-secret settings in
+`opencode-playwright.json` using these keys. Token file paths may be absolute or
+relative to the OpenCode config directory. Defaults apply when no plugin option, local JSON
+setting, or environment override is set.
+
+```json
+{
+  "playwrightPort": 8931,
+  "proxyPort": 8932,
+  "windowsHost": "172.20.0.1",
+  "startupTimeoutMs": 15000
+}
+```
+
+| JSON key | Environment fallback | Default | Purpose |
+| --- | --- | --- | --- |
+| `playwrightHost` | `OPENCODE_PLAYWRIGHT_HOST` | `localhost` | Loopback host for Windows Playwright MCP. Non-loopback values are rejected in JSON; runtime option/environment values retain existing fallback behavior. |
+| `playwrightPort` | `OPENCODE_PLAYWRIGHT_PORT` | `8931` | MCP server port, bound to loopback on Windows. |
+| `proxyHost` | `OPENCODE_PLAYWRIGHT_PROXY_HOST` | `0.0.0.0` | Proxy bind address. Socket-peer checks and bearer authentication still apply. |
+| `proxyPort` | `OPENCODE_PLAYWRIGHT_PROXY_PORT` | `8932` | Authenticated proxy port used by WSL. |
+| `windowsHost` | `OPENCODE_PLAYWRIGHT_WINDOWS_HOST` | Detected WSL host; otherwise `127.0.0.1` | Windows host WSL uses to reach the MCP proxy. Explicit setting overrides automatic detection. |
+| `browserExecutable` | `OPENCODE_PLAYWRIGHT_EXECUTABLE_PATH` | `C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe` | Brave executable path. |
+| `profileDirName` | `OPENCODE_PLAYWRIGHT_PROFILE_DIR_NAME` | `Default` | Brave profile directory used by Playwright. |
+| `extensionTokenFile` | `OPENCODE_PLAYWRIGHT_EXTENSION_TOKEN_FILE` | `.secrets/playwright-key` | Extension token file path. Token contents stay in file or secret environment variable. |
+| `proxyTokenFile` | `OPENCODE_PLAYWRIGHT_PROXY_TOKEN_FILE` | `.secrets/playwright-mcp-proxy-key` | Proxy token file path. Explicitly setting a path disables default token generation; configured file must already exist. |
+| `startupTimeoutMs` | `OPENCODE_PLAYWRIGHT_STARTUP_TIMEOUT_MS` | `15000` | Maximum time to wait for MCP readiness. |
+| `startupPollMs` | `OPENCODE_PLAYWRIGHT_STARTUP_POLL_MS` | `100` | Interval between readiness checks. |
+| `shutdownTimeoutMs` | `OPENCODE_PLAYWRIGHT_SHUTDOWN_TIMEOUT_MS` | `5000` | Graceful child-process shutdown timeout before force cleanup. |
+| `windowsServiceUrl` | `OPENCODE_PLAYWRIGHT_WINDOWS_SERVICE_URL` | `http://127.0.0.1:49374` | Windows OpenCode service API used by WSL to request owner lifecycle actions. |
+
+Unknown keys and values with invalid types or ranges make setup fail safely. Ports
+must be different integers from `1` to `65535`; timeout values must be positive integers no
+greater than `2147483647`. `windowsServiceUrl` must be an HTTP(S) origin without
+credentials, path, query, or fragment. HTTP is allowed only for loopback addresses;
+other hosts require HTTPS. These URL and port checks also apply after merging plugin
+options and environment variables. The plugin does not include configuration
+contents in diagnostics. `OPENCODE_CONFIG_DIR`,
+`XDG_DATA_HOME`, and WSL detection markers remain runtime path/platform inputs; they
+are not JSON settings. `OPENCODE_PLAYWRIGHT_EXTENSION_TOKEN` and
+`OPENCODE_SERVER_PASSWORD` are secret environment inputs and are not accepted in JSON.
+
+The corresponding environment variables are listed below, including secret and
+runtime-only inputs:
 
 | Environment variable | Default | Purpose |
 | --- | --- | --- |
@@ -95,11 +162,11 @@ environment override is set.
 | `OPENCODE_PLAYWRIGHT_EXTENSION_TOKEN` | Unset; reads the extension key file instead | Extension key passed privately to the Playwright MCP child process. Set on the Windows OpenCode service only. |
 | `OPENCODE_PLAYWRIGHT_EXTENSION_TOKEN_FILE` | `.secrets/playwright-key` | Path to the extension key file. Ignored when the direct token environment variable is set. |
 | `OPENCODE_PLAYWRIGHT_PROXY_TOKEN_FILE` | `.secrets/playwright-mcp-proxy-key` | Path to the proxy bearer token file; same token must be present on Windows and WSL. |
-| `OPENCODE_PLAYWRIGHT_HOST` | `localhost` | Loopback host for the Windows Playwright MCP server. Non-loopback values are restricted to `127.0.0.1`. |
+| `OPENCODE_PLAYWRIGHT_HOST` | `localhost` | Loopback host for the Windows Playwright MCP server. Non-loopback values fall back to `127.0.0.1`. |
 | `OPENCODE_PLAYWRIGHT_PORT` | `8931` | MCP server port, bound to loopback on Windows. |
-| `OPENCODE_PLAYWRIGHT_PROXY_HOST` | `0.0.0.0` | Bind address for the proxy that WSL connects to. Source-IP checks allow only addresses in the currently discovered WSL vEthernet NAT subnet. |
+| `OPENCODE_PLAYWRIGHT_PROXY_HOST` | `0.0.0.0` | Proxy bind address. Socket-peer checks admit loopback peers or IPv4 peers in currently discovered, fully validated WSL vEthernet NAT CIDRs; bearer authentication remains mandatory. |
 | `OPENCODE_PLAYWRIGHT_PROXY_PORT` | `8932` | Authenticated proxy port used by WSL. |
-| `OPENCODE_PLAYWRIGHT_WINDOWS_HOST` | Auto-detected from WSL routing/DNS; fallback `127.0.0.1` | Windows host address WSL uses to reach the MCP proxy. |
+| `OPENCODE_PLAYWRIGHT_WINDOWS_HOST` | `127.0.0.1` in detected mirrored mode; otherwise gateway, DNS, then `127.0.0.1` | Windows host address WSL uses to reach the MCP proxy. An explicit value overrides automatic detection. |
 | `OPENCODE_PLAYWRIGHT_EXECUTABLE_PATH` | `C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe` | Brave executable path. |
 | `OPENCODE_PLAYWRIGHT_PROFILE_DIR_NAME` | `Default` | Brave profile directory used by Playwright. |
 | `OPENCODE_PLAYWRIGHT_STARTUP_TIMEOUT_MS` | `15000` | Maximum time to wait for MCP readiness. |
@@ -112,23 +179,47 @@ environment override is set.
 
 Port `8931` is the local Playwright MCP server launched beside Brave on Windows.
 Port `8932` is a separate authenticated proxy that WSL can reach; it forwards
-requests to the local MCP server and requires the shared proxy token. Keeping the
-MCP server on loopback avoids exposing it directly to WSL or the network, while the
-proxy provides the controlled cross-WSL connection. The two ports must be distinct.
+requests to the local MCP server and requires the shared proxy token. The two ports
+must be distinct. Loopback binding keeps MCP off network-facing interfaces, but
+mirrored WSL can also reach an IPv4-loopback MCP listener directly. The proxy does
+not add bearer authentication to direct connections to MCP port `8931`; its token
+protects only proxy port `8932`.
 
-The proxy continues to bind to `0.0.0.0`, but checks each connection's source IP
-against the currently discovered WSL `vEthernet` NAT subnet and fails closed when
-that subnet cannot be discovered. This is a source-subnet check, not WSL process
-identity or full network isolation: the proxy does not verify the incoming network
-interface, and any client whose source address is in the same subnet can match.
+The proxy binds to `0.0.0.0` by default. It strictly parses each socket peer address
+and admits only loopback peers or non-loopback IPv4 peers within the currently
+discovered, fully validated WSL `vEthernet` NAT CIDRs. It never trusts forwarding
+headers. Unknown or malformed peers are denied. NAT discovery is not required for
+startup or authenticated loopback access; non-loopback peers are denied when
+discovery is missing, fails, or returns invalid CIDRs. Every admitted peer still
+requires the proxy bearer token.
+
+Authenticated local Windows and WSL processes can use the proxy. Source checks do
+not establish WSL process identity or full network isolation: the proxy does not
+verify the incoming network interface, and any client whose source address falls
+within an allowed NAT CIDR can match.
 Windows may still show an OS firewall warning because the proxy binds on all
 interfaces; the plugin does not change firewall settings. Do not add port forwarding
-or expose the proxy port beyond the trusted host/network. The proxy bearer token
-remains mandatory in addition to the source-IP check.
+or expose the proxy port beyond the trusted host/network.
 
-This access model relies on WSL NAT networking. Mirrored networking and WSL
-localhost/loopback access may not present a source address in the discovered NAT
-subnet and are not supported by this subnet check.
+### WSL host detection
+
+For automatic WSL host detection, the plugin runs `wslinfo --networking-mode` with
+a bounded timeout. Detected mirrored mode uses IPv4 `127.0.0.1`, not `::1`. For NAT,
+an unknown mode, or unavailable `wslinfo`, it tries the routing gateway, then the
+nameserver in `/etc/resolv.conf`, then `127.0.0.1`. Explicit
+plugin `windowsHost` option, local `windowsHost` setting, then
+`OPENCODE_PLAYWRIGHT_WINDOWS_HOST` override automatic detection. Endpoint overrides
+also take precedence.
+
+If older WSL lacks `wslinfo` but uses mirrored networking, set
+`OPENCODE_PLAYWRIGHT_WINDOWS_HOST=127.0.0.1` in the WSL OpenCode service environment.
+You do not need to change your WSL networking mode or `hostAddressLoopback` setting.
+Microsoft documents [mirrored IPv4 localhost access](https://learn.microsoft.com/windows/wsl/networking#mirrored-mode-networking)
+and confirms that [`hostAddressLoopback=true` is not required for `127.0.0.1`](https://learn.microsoft.com/windows/wsl/wsl-config#experimental-settings).
+
+If the initial WSL start does not reach a ready proxy, automatic retries probe the
+authenticated proxy without sending more Windows owner lifecycle requests. Use
+`/playwright-start` or `/playwright-restart` to request the Windows owner explicitly.
 
 ## Logs
 

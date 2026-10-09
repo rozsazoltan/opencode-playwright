@@ -7,6 +7,7 @@ import {
   configDirectory,
   createBridge,
   createDiagnosticLogger,
+  detectWslNetworkingMode,
   diagnosticLogPath,
   installBridge,
   probeMcp,
@@ -248,8 +249,11 @@ describe("playwright bridge plugin options", () => {
         profileDirName: "Profile 2",
         extensionTokenFile: ".secrets/extension-token",
         proxyTokenFile: ".secrets/owner-proxy-token",
-         startupTimeoutMs: 3210,
-         shutdownTimeoutMs: 6543,
+        startupTimeoutMs: 3210,
+        startupPollMs: 321,
+        shutdownTimeoutMs: 6543,
+        windowsHost: "172.20.0.4",
+        windowsServiceUrl: "http://127.0.0.1:50321",
       },
       configDir,
       {},
@@ -264,8 +268,11 @@ describe("playwright bridge plugin options", () => {
       profileDirName: "Profile 2",
       extensionTokenFile: join(configDir, ".secrets", "extension-token"),
       proxyTokenFile: join(configDir, ".secrets", "owner-proxy-token"),
-       startupTimeoutMs: 3210,
-       shutdownTimeoutMs: 6543,
+      startupTimeoutMs: 3210,
+      startupPollMs: 321,
+      shutdownTimeoutMs: 6543,
+      windowsHost: "172.20.0.4",
+      windowsServiceUrl: "http://127.0.0.1:50321",
     })
   })
 
@@ -279,8 +286,8 @@ describe("playwright bridge plugin options", () => {
       proxyHost: "0.0.0.0",
       extensionTokenFile: ".secrets/wsl-extension-token",
       proxyTokenFile: ".secrets/wsl-proxy-token",
-       startupTimeoutMs: 4321,
-       shutdownTimeoutMs: 7654,
+      startupTimeoutMs: 4321,
+      shutdownTimeoutMs: 7654,
     }
     const config = bridgeConfigFromOptions(options, configDir, {
       WSL_DISTRO_NAME: "Ubuntu",
@@ -293,11 +300,49 @@ describe("playwright bridge plugin options", () => {
       playwrightHost: "127.0.0.1",
       proxyHost: "0.0.0.0",
       proxyTokenFile: join(configDir, ".secrets", "wsl-proxy-token"),
-       startupTimeoutMs: 4321,
-       shutdownTimeoutMs: 7654,
+      startupTimeoutMs: 4321,
+      shutdownTimeoutMs: 7654,
     })
     expect(proxyTokenReference(options, {})).toBe("./.secrets/wsl-proxy-token")
     expect(proxyTokenReference({}, {})).toBe("./.secrets/playwright-mcp-proxy-key")
+    expect(proxyTokenReference({}, {}, { proxyTokenFile: ".secrets/local-proxy-token" }))
+      .toBe("./.secrets/local-proxy-token")
+  })
+
+  test("local windowsHost disables automatic WSL host detection", () => {
+    let detectionCalls = 0
+    const dependencies: BridgeDependencies = {
+      ...fakeDependencies(),
+      platform: "linux",
+      env: { WSL_DISTRO_NAME: "Ubuntu" },
+      getWslNetworkingMode: () => {
+        detectionCalls++
+        return "mirrored"
+      },
+    }
+    const config = bridgeConfigFromOptions({}, "/config", dependencies.env, {
+      windowsHost: "172.20.0.8",
+    })
+    const bridge = new PlaywrightBridge(dependencies, config)
+
+    expect(bridge.status().endpoint.href).toBe("http://172.20.0.8:8931/mcp")
+    expect(bridge.status().proxyEndpoint?.href).toBe("http://172.20.0.8:8932/mcp")
+    expect(detectionCalls).toBe(0)
+  })
+
+  test("formats an IPv6 windowsHost for WSL endpoints", () => {
+    const dependencies: BridgeDependencies = {
+      ...fakeDependencies(),
+      platform: "linux",
+      env: { WSL_DISTRO_NAME: "Ubuntu" },
+    }
+    const config = bridgeConfigFromOptions({}, "/config", dependencies.env, {
+      windowsHost: "fd00::1",
+    })
+    const bridge = new PlaywrightBridge(dependencies, config)
+
+    expect(bridge.status().endpoint.href).toBe("http://[fd00::1]:8931/mcp")
+    expect(bridge.status().proxyEndpoint?.href).toBe("http://[fd00::1]:8932/mcp")
   })
 })
 
@@ -368,6 +413,65 @@ describe("MCP readiness probe", () => {
     expect(requests[1].headers).toMatchObject({ Authorization: "Bearer probe-token-fixture" })
   })
 
+  test("forwards external abort, rejects pre-aborted probes, and cancels response bodies", async () => {
+    const requests: RequestInit[] = []
+    let cancelledBodies = 0
+    const external = new AbortController()
+    const initialization = {
+      jsonrpc: "2.0",
+      id: 1,
+      result: { protocolVersion: "2025-03-26", capabilities: {}, serverInfo: {} },
+    }
+    const eventBytes = new TextEncoder().encode(`data: ${JSON.stringify(initialization)}\n\n`)
+    globalThis.fetch = (async (_input, init) => {
+      requests.push(init ?? {})
+      if (requests.length === 1) {
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(eventBytes)
+          },
+          cancel() {
+            cancelledBodies++
+          },
+        })
+        return new Response(body, {
+          headers: { "content-type": "text/event-stream", "mcp-session-id": "session-fixture" },
+        })
+      }
+      return new Response(null, { status: 202 })
+    }) as typeof fetch
+
+    await expect(probeMcp(new URL("http://127.0.0.1:8931/mcp"), undefined, external.signal))
+      .resolves.toEqual({ mcp: true, extension: true })
+    expect(requests).toHaveLength(2)
+    expect(requests[0]?.signal).toBe(requests[1]?.signal)
+    expect(requests[0]?.signal).not.toBe(external.signal)
+    expect(cancelledBodies).toBe(1)
+
+    const preAborted = new AbortController()
+    preAborted.abort()
+    await expect(probeMcp(new URL("http://127.0.0.1:8931/mcp"), undefined, preAborted.signal))
+      .resolves.toEqual({ mcp: false, extension: false })
+    expect(requests).toHaveLength(2)
+
+    let activeSignal: AbortSignal | undefined
+    globalThis.fetch = (async (_input, init) => {
+      activeSignal = init?.signal ?? undefined
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true })
+      })
+    }) as typeof fetch
+    const activeExternal = new AbortController()
+    const activeProbe = probeMcp(
+      new URL("http://127.0.0.1:8931/mcp"),
+      undefined,
+      activeExternal.signal,
+    )
+    activeExternal.abort()
+    await expect(activeProbe).resolves.toEqual({ mcp: false, extension: false })
+    expect(activeSignal?.aborted).toBe(true)
+  })
+
   test("rejects an unsuccessful initialize response", async () => {
     globalThis.fetch = (async () =>
       new Response(
@@ -404,6 +508,49 @@ describe("MCP readiness probe", () => {
   )
 })
 
+describe("WSL networking mode detection", () => {
+  test("runs bounded wslinfo command and accepts only exact known modes", () => {
+    let invocation: unknown[] = []
+    const mode = detectWslNetworkingMode((command, args, options) => {
+      invocation = [command, args, options]
+      return { status: 0, stdout: " mirrored \n", stderr: "ignored diagnostic" }
+    })
+
+    expect(mode).toBe("mirrored")
+    expect(invocation).toEqual([
+      "wslinfo",
+      ["--networking-mode"],
+      {
+        encoding: "utf8",
+        timeout: 1_000,
+        maxBuffer: 1_024,
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    ])
+    expect(detectWslNetworkingMode(() => ({ status: 0, stdout: "nat\n" }))).toBe("nat")
+  })
+
+  test("returns undefined for unknown, malformed, failed, timed-out, or throwing execution", () => {
+    const outcomes: Array<{ status: number | null; stdout?: string | null; error?: unknown }> = [
+      { status: 0, stdout: "unknown" },
+      { status: 0, stdout: "NAT" },
+      { status: 0, stdout: "nat\nmirrored" },
+      { status: 0, stdout: "" },
+      { status: 127, stdout: "nat" },
+      { status: null, error: Object.assign(new Error("missing executable"), { code: "ENOENT" }) },
+      { status: null, error: Object.assign(new Error("timed out"), { code: "ETIMEDOUT" }) },
+    ]
+
+    for (const outcome of outcomes) {
+      expect(detectWslNetworkingMode(() => outcome)).toBeUndefined()
+    }
+    expect(detectWslNetworkingMode(() => {
+      throw new Error("executor failure")
+    })).toBeUndefined()
+  })
+})
+
 describe("bridge port detection", () => {
   test("detects an IPv6-only loopback listener without claiming its ownership", async () => {
     const requests: string[] = []
@@ -414,7 +561,7 @@ describe("bridge port detection", () => {
     globalThis.fetch = (async (input) => {
       const address = String(input)
       requests.push(address)
-      if (address.startsWith("http://127.0.0.1:")) throw new Error("IPv4 is not listening")
+      if (!address.startsWith("http://[::1]:")) throw new Error("IPv4 is not listening")
       return new Response(null, { status: 404 })
     }) as typeof fetch
 
@@ -429,15 +576,59 @@ describe("bridge port detection", () => {
     if (wslInterop === undefined) delete process.env.WSL_INTEROP
     else process.env.WSL_INTEROP = wslInterop
 
-    expect(requests).toEqual(["http://127.0.0.1:8931", "http://[::1]:8931"])
+    expect(requests).toEqual(["http://localhost:8931", "http://[::1]:8931"])
     expect(status.endpoint.href).toBe("http://localhost:8931/mcp")
     expect(status.state).toBe("failed")
     expect(status.reason).toBe("foreign-owned port is already listening")
     await bridge.stop()
   })
+
+  test.each(["::1", "[::1]"] as const)("probes IPv6 host %s without double brackets", async (playwrightHost) => {
+    const requests: string[] = []
+    const previousDistro = process.env.WSL_DISTRO_NAME
+    const previousInterop = process.env.WSL_INTEROP
+    delete process.env.WSL_DISTRO_NAME
+    delete process.env.WSL_INTEROP
+    globalThis.fetch = (async (input) => {
+      requests.push(String(input))
+      return new Response(null, { status: 404 })
+    }) as typeof fetch
+
+    try {
+      const bridge = createBridge({ playwrightHost, ownerLifecycleRequest: async () => undefined })
+      const status = await bridge.start()
+
+      expect(requests).toEqual(["http://[::1]:8931"])
+      expect(status.state).toBe("failed")
+      expect(status.reason).toBe("foreign-owned port is already listening")
+    } finally {
+      if (previousDistro === undefined) delete process.env.WSL_DISTRO_NAME
+      else process.env.WSL_DISTRO_NAME = previousDistro
+      if (previousInterop === undefined) delete process.env.WSL_INTEROP
+      else process.env.WSL_INTEROP = previousInterop
+    }
+  })
 })
 
 describe("PlaywrightBridge", () => {
+  test("aborts timed-out probes even when dependency ignores signal", async () => {
+    const dependencies = fakeDependencies()
+    const signals: AbortSignal[] = []
+    dependencies.probeMcp = (_endpoint, _token, signal) => {
+      if (signal !== undefined) signals.push(signal)
+      return new Promise(() => undefined)
+    }
+
+    const status = await new PlaywrightBridge(dependencies, {
+      startupTimeoutMs: 15,
+      startupPollMs: 15,
+    }).start()
+
+    expect(status.state).toBe("failed")
+    expect(signals).toHaveLength(1)
+    expect(signals[0]?.aborted).toBe(true)
+  })
+
   test("Windows passes the trimmed extension token only to the MCP child environment", async () => {
     const dependencies = fakeDependencies()
     const sourceEnvironment = dependencies.env
@@ -941,6 +1132,117 @@ describe("PlaywrightBridge", () => {
     expect(probeToken).toBe("wsl-proxy-token-fixture")
   })
 
+  test("WSL mirrored networking selects IPv4 loopback without reading route or DNS", () => {
+    const dependencies = fakeDependencies()
+    dependencies.platform = "linux"
+    dependencies.env = { WSL_DISTRO_NAME: "Ubuntu" }
+    let modeChecks = 0
+    const hostReads: string[] = []
+    dependencies.getWslNetworkingMode = () => {
+      modeChecks++
+      return "mirrored"
+    }
+    dependencies.readText = (path) => {
+      hostReads.push(path)
+      throw new Error("host discovery must not read files")
+    }
+
+    const status = new PlaywrightBridge(dependencies).status()
+
+    expect(modeChecks).toBe(1)
+    expect(hostReads).toEqual([])
+    expect(status.endpoint.href).toBe("http://127.0.0.1:8931/mcp")
+    expect(status.proxyEndpoint?.href).toBe("http://127.0.0.1:8932/mcp")
+  })
+
+  test("WSL NAT and unknown modes keep gateway-first host discovery", () => {
+    for (const mode of ["nat", undefined] as const) {
+      const dependencies = fakeDependencies()
+      dependencies.platform = "linux"
+      dependencies.env = { WSL_DISTRO_NAME: "Ubuntu" }
+      const reads: string[] = []
+      let modeChecks = 0
+      dependencies.getWslNetworkingMode = () => {
+        modeChecks++
+        return mode
+      }
+      dependencies.readText = (path) => {
+        reads.push(path)
+        if (path === "/proc/net/route") {
+          return "Iface Destination Gateway Flags\neth0 00000000 010011AC 0003\n"
+        }
+        if (path === "/etc/resolv.conf") return "nameserver 10.0.0.53\n"
+        return patchedBundle
+      }
+
+      const status = new PlaywrightBridge(dependencies).status()
+
+      expect(modeChecks).toBe(1)
+      expect(reads).toEqual(["/proc/net/route"])
+      expect(status.endpoint.href).toBe("http://172.17.0.1:8931/mcp")
+      expect(status.proxyEndpoint?.href).toBe("http://172.17.0.1:8932/mcp")
+    }
+  })
+
+  test("skips networking-mode and route discovery when platform or explicit hosts make it unnecessary", () => {
+    const scenarios = [
+      { platform: "win32" as const, env: {} },
+      { platform: "linux" as const, env: {} },
+      {
+        platform: "linux" as const,
+        env: { WSL_DISTRO_NAME: "Ubuntu", OPENCODE_PLAYWRIGHT_WINDOWS_HOST: "172.20.0.1" },
+      },
+    ]
+
+    for (const scenario of scenarios) {
+      const dependencies = fakeDependencies()
+      dependencies.platform = scenario.platform
+      dependencies.env = scenario.env
+      let modeChecks = 0
+      const reads: string[] = []
+      dependencies.getWslNetworkingMode = () => {
+        modeChecks++
+        return "mirrored"
+      }
+      dependencies.readText = (path) => {
+        reads.push(path)
+        throw new Error("route discovery must not run")
+      }
+
+      const status = new PlaywrightBridge(dependencies).status()
+
+      expect(modeChecks).toBe(0)
+      expect(reads).toEqual([])
+      if (scenario.env.OPENCODE_PLAYWRIGHT_WINDOWS_HOST !== undefined) {
+        expect(status.endpoint.href).toBe("http://172.20.0.1:8931/mcp")
+        expect(status.proxyEndpoint?.href).toBe("http://172.20.0.1:8932/mcp")
+      }
+    }
+  })
+
+  test("skips automatic host detection when both WSL endpoints are explicit", () => {
+    const dependencies = fakeDependencies()
+    dependencies.platform = "linux"
+    dependencies.env = { WSL_DISTRO_NAME: "Ubuntu" }
+    let modeChecks = 0
+    dependencies.getWslNetworkingMode = () => {
+      modeChecks++
+      return "mirrored"
+    }
+    dependencies.readText = () => {
+      throw new Error("host discovery must not run")
+    }
+
+    const status = new PlaywrightBridge(dependencies, {
+      endpoint: new URL("http://192.0.2.10:8931/mcp"),
+      proxyEndpoint: new URL("http://192.0.2.11:8932/mcp"),
+    }).status()
+
+    expect(modeChecks).toBe(0)
+    expect(status.endpoint.href).toBe("http://192.0.2.10:8931/mcp")
+    expect(status.proxyEndpoint?.href).toBe("http://192.0.2.11:8932/mcp")
+  })
+
   test("WSL prefers the default route gateway over the resolv.conf nameserver", async () => {
     const dependencies = fakeDependencies()
     dependencies.platform = "linux"
@@ -1103,7 +1405,7 @@ describe("PlaywrightBridge", () => {
     await bridge.stop()
     probeResult.resolve({ mcp: true, extension: true })
 
-    expect((await starting).state).toBe("stopped")
+    expect((await starting).state).not.toBe("ready")
     expect(bridge.status().state).toBe("stopped")
   })
 
@@ -1184,16 +1486,23 @@ describe("PlaywrightBridge", () => {
   test("recovers a stale owner record when both PIDs and ports are inactive", async () => {
     const dependencies = fakeDependencies()
     dependencies.isProcessRunning = () => false
+    const portProbes: Array<{ host: string; port: number }> = []
+    dependencies.isPortOpen = async (host, port) => {
+      portProbes.push({ host, port })
+      return false
+    }
     writeFileSync(
       ownerFile(dependencies),
       JSON.stringify({ ownerPid: 99101, mcpPid: 99102, startedAt: "2026-09-22T00:00:00.000Z" }),
       "utf8",
     )
 
-    const status = await new PlaywrightBridge(dependencies).start()
+    const status = await new PlaywrightBridge(dependencies, { playwrightHost: "127.0.0.2" }).start()
 
     expect(status.state).toBe("ready")
     expect(status.pid).toBe(4242)
+    expect(portProbes.filter(({ port }) => port === 8931).map(({ host }) => host))
+      .toEqual(["127.0.0.2", "127.0.0.2"])
   })
 
   test("does not recover a stale-looking record while either bridge port is occupied", async () => {

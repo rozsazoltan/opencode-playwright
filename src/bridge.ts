@@ -14,6 +14,7 @@ export type BridgeConfig = {
   playwrightPort: number
   proxyHost: string
   proxyPort: number
+  windowsHost?: string
   endpoint: URL
   proxyEndpoint: URL
   browserExecutable: string
@@ -58,9 +59,14 @@ export type BridgeDependencies = {
   killTree(pid: number): Promise<void>
   isProcessRunning?(pid: number): boolean
   sleep(ms: number): Promise<void>
-  probeMcp(endpoint: URL, bearerToken?: string): Promise<{ mcp: boolean; extension: boolean }>
+  probeMcp(
+    endpoint: URL,
+    bearerToken?: string,
+    signal?: AbortSignal,
+  ): Promise<{ mcp: boolean; extension: boolean }>
   now(): Date
   startProxy?(options: ProxyOptions): StartedProxy
+  getWslNetworkingMode?(): "nat" | "mirrored" | undefined
   /** Request the Windows owner to perform a lifecycle operation from WSL. */
   requestOwnerLifecycle?(action: OwnerLifecycleAction): Promise<void>
 }
@@ -118,7 +124,8 @@ function configPath(configDir: string, value: string): string {
 }
 
 function endpoint(host: string, port: number): URL {
-  return new URL(`http://${host}:${port}/mcp`)
+  const formattedHost = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host
+  return new URL(`http://${formattedHost}:${port}/mcp`)
 }
 
 function playwrightArguments(config: BridgeConfig, mcpCli: string): string[] {
@@ -185,12 +192,30 @@ function resolveConfig(
   const env = dependencies.env
   const configDir = overrides.configDir ?? env.OPENCODE_CONFIG_DIR ?? process.cwd()
   const wsl = isWsl(dependencies)
-  const windowsHost =
-    env.OPENCODE_PLAYWRIGHT_WINDOWS_HOST ?? (wsl ? wslGateway(dependencies) : undefined) ?? "127.0.0.1"
+  const explicitWindowsHost = overrides.windowsHost ?? env.OPENCODE_PLAYWRIGHT_WINDOWS_HOST
+  const needsAutomaticWindowsHost = wsl && explicitWindowsHost === undefined &&
+    !(overrides.endpoint !== undefined && overrides.proxyEndpoint !== undefined)
+  let networkingMode: "nat" | "mirrored" | undefined
+  if (needsAutomaticWindowsHost) {
+    try {
+      networkingMode = dependencies.getWslNetworkingMode?.()
+    } catch {
+      // An unavailable mode detector preserves legacy NAT host discovery.
+    }
+  }
+  const automaticWindowsHost = needsAutomaticWindowsHost
+    ? networkingMode === "mirrored"
+      ? "127.0.0.1"
+      : wslGateway(dependencies)
+    : undefined
+  const windowsHost = explicitWindowsHost ?? automaticWindowsHost ?? "127.0.0.1"
   const playwrightHost = loopbackHost(overrides.playwrightHost ?? env.OPENCODE_PLAYWRIGHT_HOST)
   const playwrightPort = overrides.playwrightPort ?? integer(env.OPENCODE_PLAYWRIGHT_PORT, 8931)
   const proxyHost = overrides.proxyHost ?? env.OPENCODE_PLAYWRIGHT_PROXY_HOST ?? "0.0.0.0"
   const proxyPort = overrides.proxyPort ?? integer(env.OPENCODE_PLAYWRIGHT_PROXY_PORT, 8932)
+  if (playwrightPort === proxyPort) {
+    throw new Error("playwrightPort and proxyPort must be different")
+  }
 
   return {
     configDir,
@@ -198,6 +223,7 @@ function resolveConfig(
     playwrightPort,
     proxyHost,
     proxyPort,
+    windowsHost,
     endpoint: overrides.endpoint ?? endpoint(wsl ? windowsHost : playwrightHost, playwrightPort),
     proxyEndpoint: overrides.proxyEndpoint ?? endpoint(windowsHost, proxyPort),
     browserExecutable:
@@ -296,6 +322,7 @@ export class PlaywrightBridge {
   private childPid?: number
   private patchVerified = false
   private lifecycleGeneration = 0
+  private lifecycleController = new AbortController()
   private ownerStartedAt?: string
   private proxy?: StartedProxy
   private childExitWaiter?: { pid: number; resolve: (exited: boolean) => void }
@@ -311,19 +338,21 @@ export class PlaywrightBridge {
   }
 
   async start(): Promise<BridgeStatus> {
-    const generation = ++this.lifecycleGeneration
-    if (isWsl(this.dependencies)) return this.startWsl(generation)
+    const lifecycle = this.advanceLifecycle()
+    if (isWsl(this.dependencies)) {
+      return this.startWsl(lifecycle.generation, lifecycle.signal)
+    }
 
     this.setStatus("starting")
 
     let portOpen: boolean
     try {
-      portOpen = await this.dependencies.isPortOpen("127.0.0.1", Number(this.config.endpoint.port))
+      portOpen = await this.dependencies.isPortOpen(this.config.playwrightHost, Number(this.config.endpoint.port))
     } catch (error) {
-      if (!this.isCurrent(generation)) return this.status()
+      if (!this.isCurrent(lifecycle.generation)) return this.status()
       return this.setStatus("failed", "Playwright port check failed")
     }
-    if (!this.isCurrent(generation)) return this.status()
+    if (!this.isCurrent(lifecycle.generation)) return this.status()
 
     if (portOpen) {
       const owner = readOwner(this.config.ownerFile)
@@ -334,7 +363,7 @@ export class PlaywrightBridge {
         owner.mcpPid === this.childPid &&
         owner.startedAt === this.ownerStartedAt
       ) {
-        return this.waitUntilReady(generation)
+        return this.waitUntilReady(lifecycle.generation, lifecycle.signal)
       }
       return this.setStatus("failed", "foreign-owned port is already listening")
     }
@@ -395,12 +424,18 @@ export class PlaywrightBridge {
       const reason = error instanceof Error && safeReasons.includes(error.message)
         ? error.message
         : "Playwright prerequisite check failed unexpectedly"
+      if (!this.isCurrent(lifecycle.generation)) return this.status()
       return this.setStatus("failed", reason)
     }
     try {
       await this.acquireOwnerRecord()
     } catch (error) {
+      if (!this.isCurrent(lifecycle.generation)) return this.status()
       return this.setStatus("failed", ownerLockFailureReason(error))
+    }
+    if (!this.isCurrent(lifecycle.generation)) {
+      this.removeOwnerRecord()
+      return this.status()
     }
 
     const args = playwrightArguments(this.config, resolvedMcpCli)
@@ -422,7 +457,7 @@ export class PlaywrightBridge {
           this.childExitWaiter = undefined
         }
         const wasStopping = this.current.state === "stopping"
-        this.lifecycleGeneration++
+        this.advanceLifecycle()
         this.stopProxy()
         this.childPid = undefined
         this.removeOwnerRecord()
@@ -434,21 +469,28 @@ export class PlaywrightBridge {
         }
       })
     } catch (error) {
-      return this.failStartup(generation, "Playwright MCP process could not start")
+      return this.failStartup(lifecycle.generation, "Playwright MCP process could not start")
     }
 
-    return this.waitUntilReady(generation)
+    return this.waitUntilReady(lifecycle.generation, lifecycle.signal)
   }
 
   async stop(): Promise<void> {
+    const lifecycle = this.advanceLifecycle()
     if (isWsl(this.dependencies)) {
-      if (this.dependencies.requestOwnerLifecycle !== undefined) {
-        await this.dependencies.requestOwnerLifecycle("stop")
+      try {
+        if (this.dependencies.requestOwnerLifecycle !== undefined) {
+          await this.dependencies.requestOwnerLifecycle("stop")
+        }
+      } catch (error) {
+        if (this.isCurrent(lifecycle.generation)) {
+          this.setStatus("failed", "Windows Playwright owner request failed")
+        }
+        throw error
       }
-      this.setStatus("stopped")
+      if (this.isCurrent(lifecycle.generation)) this.setStatus("stopped")
       return
     }
-    ++this.lifecycleGeneration
     const pid = this.childPid
     this.setStatus("stopping")
 
@@ -475,7 +517,7 @@ export class PlaywrightBridge {
 
   async detach(): Promise<void> {
     if (isWsl(this.dependencies)) {
-      ++this.lifecycleGeneration
+      this.advanceLifecycle()
       this.setStatus("stopped")
       return
     }
@@ -483,8 +525,10 @@ export class PlaywrightBridge {
   }
 
   async restart(): Promise<BridgeStatus> {
-    const generation = ++this.lifecycleGeneration
-    if (isWsl(this.dependencies)) return this.startWsl(generation, "restart")
+    const lifecycle = this.advanceLifecycle()
+    if (isWsl(this.dependencies)) {
+      return this.startWsl(lifecycle.generation, lifecycle.signal, "restart")
+    }
 
     // A failed/stopped bridge normally has no owned child left to stop.  Start
     // directly in that case so restart remains a recovery operation.  When a
@@ -500,12 +544,43 @@ export class PlaywrightBridge {
     return this.start()
   }
 
+  async retryWslProxy(): Promise<BridgeStatus> {
+    if (!isWsl(this.dependencies)) return this.start()
+
+    const lifecycle = this.advanceLifecycle()
+    this.setStatus("starting")
+
+    let bearerToken: string
+    try {
+      bearerToken = this.dependencies.readText(this.config.proxyTokenFile).trim()
+      if (bearerToken.length === 0) throw new Error("Playwright proxy token is empty")
+    } catch {
+      return this.setStatus("failed", "Windows Playwright proxy probe failed")
+    }
+
+    const result = await this.probeBeforeDeadline(
+      this.config.proxyEndpoint,
+      this.config.startupTimeoutMs,
+      bearerToken,
+      lifecycle.signal,
+    )
+    if (!this.isCurrent(lifecycle.generation)) return this.status()
+    if (result.kind === "probe" && result.value.mcp && result.value.extension) {
+      return this.setStatus("ready", undefined, true)
+    }
+    if (result.kind === "error") {
+      return this.setStatus("failed", "Windows Playwright proxy probe failed")
+    }
+    return this.setStatus("failed", "Windows Playwright proxy is not ready")
+  }
+
   status(): BridgeStatus {
     return cloneStatus(this.current)
   }
 
   private async startWsl(
     generation: number,
+    signal: AbortSignal,
     action: OwnerLifecycleAction = "start",
   ): Promise<BridgeStatus> {
     this.setStatus("starting")
@@ -522,6 +597,7 @@ export class PlaywrightBridge {
             this.config.proxyEndpoint,
             WSL_PROXY_FAST_PROBE_TIMEOUT_MS,
             token,
+            signal,
           )
           if (!this.isCurrent(generation)) return this.status()
           if (result.kind === "probe" && result.value.mcp && result.value.extension) {
@@ -550,6 +626,7 @@ export class PlaywrightBridge {
             this.config.proxyEndpoint,
             this.config.startupTimeoutMs,
             bearerToken,
+            signal,
           )
           if (!this.isCurrent(generation)) return this.status()
           if (result.kind === "probe" && result.value.mcp && result.value.extension) {
@@ -563,6 +640,8 @@ export class PlaywrightBridge {
       }
     }
 
+    if (!this.isCurrent(generation)) return this.status()
+
     let bearerToken: string
     try {
       bearerToken = this.dependencies.readText(this.config.proxyTokenFile).trim()
@@ -575,6 +654,7 @@ export class PlaywrightBridge {
       this.config.proxyEndpoint,
       this.config.startupTimeoutMs,
       bearerToken,
+      signal,
     )
     if (!this.isCurrent(generation)) return this.status()
     if (result.kind === "probe" && result.value.mcp && result.value.extension) {
@@ -794,7 +874,7 @@ export class PlaywrightBridge {
     if (isRunning(owner.ownerPid) || isRunning(owner.mcpPid)) return false
 
     const [playwrightPortOpen, proxyPortOpen] = await Promise.all([
-      this.dependencies.isPortOpen("127.0.0.1", this.config.playwrightPort),
+      this.dependencies.isPortOpen(this.config.playwrightHost, this.config.playwrightPort),
       this.dependencies.isPortOpen("127.0.0.1", this.config.proxyPort),
     ])
     return !playwrightPortOpen && !proxyPortOpen
@@ -812,7 +892,7 @@ export class PlaywrightBridge {
     )
   }
 
-  private async waitUntilReady(generation: number): Promise<BridgeStatus> {
+  private async waitUntilReady(generation: number, signal: AbortSignal): Promise<BridgeStatus> {
     const startedAt = this.dependencies.now().getTime()
     const maxAttempts = Math.max(1, Math.ceil(this.config.startupTimeoutMs / this.config.startupPollMs))
 
@@ -823,7 +903,7 @@ export class PlaywrightBridge {
       const remaining = this.config.startupTimeoutMs - Math.max(elapsedByClock, elapsedByAttempts)
       if (remaining <= 0) break
 
-      const result = await this.probeBeforeDeadline(this.config.endpoint, remaining)
+      const result = await this.probeBeforeDeadline(this.config.endpoint, remaining, undefined, signal)
       if (!this.isCurrent(generation)) return this.status()
       if (result.kind === "probe" && result.value.mcp) {
         try {
@@ -869,13 +949,22 @@ export class PlaywrightBridge {
     endpoint: URL,
     timeoutMs: number,
     bearerToken?: string,
+    lifecycleSignal?: AbortSignal,
   ): Promise<
     | { kind: "probe"; value: { mcp: boolean; extension: boolean } }
     | { kind: "error" }
     | { kind: "timeout" }
   > {
+    if (lifecycleSignal?.aborted) return Promise.resolve({ kind: "error" })
+
     return new Promise((resolve) => {
       let settled = false
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const controller = new AbortController()
+      const cleanup = () => {
+        if (timer !== undefined) clearTimeout(timer)
+        lifecycleSignal?.removeEventListener("abort", onLifecycleAbort)
+      }
       const finish = (
         result:
           | { kind: "probe"; value: { mcp: boolean; extension: boolean } }
@@ -884,20 +973,45 @@ export class PlaywrightBridge {
       ) => {
         if (settled) return
         settled = true
-        clearTimeout(timer)
+        cleanup()
         resolve(result)
       }
-      const timer = setTimeout(() => finish({ kind: "timeout" }), timeoutMs)
+      const onLifecycleAbort = () => {
+        finish({ kind: "error" })
+        controller.abort()
+      }
+      timer = setTimeout(() => {
+        finish({ kind: "timeout" })
+        controller.abort()
+      }, timeoutMs)
 
-      const probe =
-        bearerToken === undefined
-          ? this.dependencies.probeMcp(endpoint)
-          : this.dependencies.probeMcp(endpoint, bearerToken)
-      probe.then(
+      lifecycleSignal?.addEventListener("abort", onLifecycleAbort, { once: true })
+      if (lifecycleSignal?.aborted) {
+        onLifecycleAbort()
+        return
+      }
+
+      let probe: Promise<{ mcp: boolean; extension: boolean }>
+      try {
+        probe = this.dependencies.probeMcp(endpoint, bearerToken, controller.signal)
+      } catch {
+        finish({ kind: "error" })
+        return
+      }
+      Promise.resolve(probe).then(
         (value) => finish({ kind: "probe", value }),
         () => finish({ kind: "error" }),
       )
     })
+  }
+
+  private advanceLifecycle(): { generation: number; signal: AbortSignal } {
+    const generation = ++this.lifecycleGeneration
+    const previous = this.lifecycleController
+    const next = new AbortController()
+    this.lifecycleController = next
+    previous.abort()
+    return { generation, signal: next.signal }
   }
 
   private removeOwnerRecord(): void {

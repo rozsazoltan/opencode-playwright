@@ -5,6 +5,12 @@ import { createRequire } from "node:module"
 import { homedir } from "node:os"
 import { dirname, isAbsolute, join } from "node:path"
 import {
+  loadLocalConfig,
+  LocalConfigError,
+  type LocalConfig,
+  validWindowsServiceUrl,
+} from "./local-config"
+import {
   PlaywrightBridge,
   type BridgeConfig,
   type BridgeDependencies,
@@ -20,6 +26,8 @@ const unsafeTools = [
 let sharedBridge: PlaywrightBridge | undefined
 let sharedProxyToken: string | undefined
 const inFlightStarts = new WeakMap<PlaywrightBridge, Promise<BridgeStatus>>()
+const inFlightWslProxyRetries = new WeakMap<PlaywrightBridge, Promise<BridgeStatus>>()
+const automaticRetryStates = new WeakMap<PlaywrightBridge, { version: number; suspended: boolean }>()
 const bridgeReferences = new WeakMap<PlaywrightBridge, { count: number }>()
 const loggedStartupFailures = new WeakMap<PlaywrightBridge, string>()
 const loggedSetupErrors = new WeakSet<object>()
@@ -29,6 +37,26 @@ type PluginOptions = Readonly<Record<string, unknown>>
 
 type OwnerLifecycleRequester = (action: OwnerLifecycleAction) => Promise<void>
 type DiagnosticLogger = (message: string) => void
+
+const WINDOWS_OWNER_HTTP_TIMEOUT_SECONDS = 10
+const WINDOWS_OWNER_PROCESS_TIMEOUT_MS = 25_000
+
+type WindowsOwnerLifecycleCommandOptions = {
+  timeout: number
+  windowsHide: true
+  stdio: "ignore"
+}
+
+type WindowsOwnerLifecycleCommandResult = {
+  status: number | null
+  error?: unknown
+}
+
+export type WindowsOwnerLifecycleExecutor = (
+  command: "powershell.exe",
+  args: string[],
+  options: WindowsOwnerLifecycleCommandOptions,
+) => WindowsOwnerLifecycleCommandResult
 
 const TOOL_SELECTION_GUIDANCE = [
   "Tool selection guidance:",
@@ -90,12 +118,19 @@ function diagnosticError(error: unknown): string {
   return error instanceof Error ? "unexpected error" : "unknown error"
 }
 
-function requestWindowsOwnerLifecycle(
+export function requestWindowsOwnerLifecycle(
   action: OwnerLifecycleAction,
   env: NodeJS.ProcessEnv,
   configDir: string,
+  execute: WindowsOwnerLifecycleExecutor = (command, args, options) => spawnSync(command, args, options),
+  configuredServiceUrl?: string,
 ): void {
-  const serviceUrl = env.OPENCODE_PLAYWRIGHT_WINDOWS_SERVICE_URL ?? "http://127.0.0.1:49374"
+  const serviceUrl = (
+    configuredServiceUrl ?? env.OPENCODE_PLAYWRIGHT_WINDOWS_SERVICE_URL ?? "http://127.0.0.1:49374"
+  ).replace(/\/+$/, "")
+  if (!validWindowsServiceUrl(serviceUrl)) {
+    throw new Error("windowsServiceUrl must use HTTPS unless it targets loopback")
+  }
   let password = env.OPENCODE_SERVER_PASSWORD
   if (password === undefined) {
     try {
@@ -110,19 +145,27 @@ function requestWindowsOwnerLifecycle(
     `$base = '${serviceUrl.replace(/'/g, "''")}'`,
     `$password = '${escapedPassword}'`,
     "$headers = if ($password.Length -gt 0) { @{ Authorization = 'Basic ' + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes('opencode:' + $password)) } } else { @{} }",
-    "$active = Invoke-RestMethod -Method Get -Uri ($base + '/api/session/active') -Headers $headers",
+    `$active = Invoke-RestMethod -Method Get -Uri ($base + '/api/session/active') -Headers $headers -TimeoutSec ${WINDOWS_OWNER_HTTP_TIMEOUT_SECONDS}`,
     "$sessionProperty = if ($null -ne $active.data) { $active.data.PSObject.Properties | Select-Object -First 1 } else { $null }",
     "$sessionId = if ($null -ne $sessionProperty) { $sessionProperty.Name } elseif ($null -ne $active.id) { $active.id } else { $null }",
     "if ([string]::IsNullOrEmpty($sessionId)) { throw 'No active Windows OpenCode session' }",
     `$body = @{ name = 'playwright-${action}'; text = '' } | ConvertTo-Json -Compress`,
-    "Invoke-RestMethod -Method Post -Uri ($base + '/api/session/' + $sessionId + '/command') -Headers $headers -ContentType 'application/json' -Body $body | Out-Null",
+    `Invoke-RestMethod -Method Post -Uri ($base + '/api/session/' + $sessionId + '/command') -Headers $headers -ContentType 'application/json' -Body $body -TimeoutSec ${WINDOWS_OWNER_HTTP_TIMEOUT_SECONDS} | Out-Null`,
   ].join("; ")
   const encoded = Buffer.from(script, "utf16le").toString("base64")
-  const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", encoded], {
-    windowsHide: true,
-    stdio: "ignore",
-  })
-  if (result.status !== 0) throw new Error("Windows Playwright owner request failed")
+  let result: WindowsOwnerLifecycleCommandResult
+  try {
+    result = execute("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", encoded], {
+      timeout: WINDOWS_OWNER_PROCESS_TIMEOUT_MS,
+      windowsHide: true,
+      stdio: "ignore",
+    })
+  } catch {
+    throw new Error("Windows Playwright owner request failed")
+  }
+  if (result.error !== undefined || result.status !== 0) {
+    throw new Error("Windows Playwright owner request failed")
+  }
 }
 
 export function configDirectory(
@@ -151,10 +194,11 @@ function optionString(options: PluginOptions, name: string): string | undefined 
 function optionInteger(
   options: PluginOptions,
   name: string,
+  configured: number | undefined,
   fallback: string | undefined,
   defaultValue: number,
 ): number {
-  const value = options[name] ?? fallback
+  const value = options[name] ?? configured ?? fallback
   const parsed = typeof value === "number" ? value : Number(String(value ?? ""))
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : defaultValue
 }
@@ -180,58 +224,116 @@ export function bridgeConfigFromOptions(
   options: PluginOptions,
   configDir: string,
   env: NodeJS.ProcessEnv = process.env,
-): Partial<BridgeConfig> {
+  localConfig: LocalConfig = {},
+): Partial<BridgeConfig> & { windowsServiceUrl: string } {
+  const optionProxyTokenFile = optionString(options, "proxyTokenFile")
+  const configuredProxyTokenFile = localConfig.proxyTokenFile
   const extensionTokenFile =
     optionString(options, "extensionTokenFile") ??
+    localConfig.extensionTokenFile ??
     env.OPENCODE_PLAYWRIGHT_EXTENSION_TOKEN_FILE ??
     ".secrets/playwright-key"
   const proxyTokenFile =
-    optionString(options, "proxyTokenFile") ??
+    optionProxyTokenFile ??
+    configuredProxyTokenFile ??
     env.OPENCODE_PLAYWRIGHT_PROXY_TOKEN_FILE ??
     ".secrets/playwright-mcp-proxy-key"
   const autoGenerateProxyToken =
-    optionString(options, "proxyTokenFile") === undefined &&
+    optionProxyTokenFile === undefined &&
+    configuredProxyTokenFile === undefined &&
     env.OPENCODE_PLAYWRIGHT_PROXY_TOKEN_FILE === undefined
+  const playwrightPort = optionInteger(
+    options,
+    "playwrightPort",
+    localConfig.playwrightPort,
+    env.OPENCODE_PLAYWRIGHT_PORT,
+    8931,
+  )
+  const proxyPort = optionInteger(
+    options,
+    "proxyPort",
+    localConfig.proxyPort,
+    env.OPENCODE_PLAYWRIGHT_PROXY_PORT,
+    8932,
+  )
+  const windowsServiceUrl =
+    optionString(options, "windowsServiceUrl") ??
+    localConfig.windowsServiceUrl ??
+    env.OPENCODE_PLAYWRIGHT_WINDOWS_SERVICE_URL ??
+    "http://127.0.0.1:49374"
+
+  if (playwrightPort === proxyPort) {
+    throw new Error("playwrightPort and proxyPort must be different")
+  }
+  if (!validWindowsServiceUrl(windowsServiceUrl)) {
+    throw new Error("windowsServiceUrl must use HTTPS unless it targets loopback")
+  }
 
   return {
     configDir,
     playwrightHost: loopbackHost(
-      optionString(options, "playwrightHost") ?? env.OPENCODE_PLAYWRIGHT_HOST ?? "localhost",
+      optionString(options, "playwrightHost") ??
+        localConfig.playwrightHost ??
+        env.OPENCODE_PLAYWRIGHT_HOST ??
+        "localhost",
     ),
-    playwrightPort: optionInteger(options, "playwrightPort", env.OPENCODE_PLAYWRIGHT_PORT, 8931),
+    playwrightPort,
     proxyHost:
-      optionString(options, "proxyHost") ?? env.OPENCODE_PLAYWRIGHT_PROXY_HOST ?? "0.0.0.0",
-    proxyPort: optionInteger(options, "proxyPort", env.OPENCODE_PLAYWRIGHT_PROXY_PORT, 8932),
+      optionString(options, "proxyHost") ??
+      localConfig.proxyHost ??
+      env.OPENCODE_PLAYWRIGHT_PROXY_HOST ??
+      "0.0.0.0",
+    proxyPort,
+    windowsHost:
+      optionString(options, "windowsHost") ??
+      localConfig.windowsHost ??
+      env.OPENCODE_PLAYWRIGHT_WINDOWS_HOST,
     browserExecutable:
       optionString(options, "browserExecutable") ??
+      localConfig.browserExecutable ??
       env.OPENCODE_PLAYWRIGHT_EXECUTABLE_PATH ??
       "C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe",
     profileDirName:
-      optionString(options, "profileDirName") ?? env.OPENCODE_PLAYWRIGHT_PROFILE_DIR_NAME ?? "Default",
+      optionString(options, "profileDirName") ??
+      localConfig.profileDirName ??
+      env.OPENCODE_PLAYWRIGHT_PROFILE_DIR_NAME ??
+      "Default",
     extensionTokenFile: resolvedSecretPath(configDir, extensionTokenFile),
     proxyTokenFile: resolvedSecretPath(configDir, proxyTokenFile),
     autoGenerateProxyToken,
     startupTimeoutMs: optionInteger(
       options,
       "startupTimeoutMs",
+      localConfig.startupTimeoutMs,
       env.OPENCODE_PLAYWRIGHT_STARTUP_TIMEOUT_MS,
       15_000,
+    ),
+    startupPollMs: optionInteger(
+      options,
+      "startupPollMs",
+      localConfig.startupPollMs,
+      env.OPENCODE_PLAYWRIGHT_STARTUP_POLL_MS,
+      100,
     ),
     shutdownTimeoutMs: optionInteger(
       options,
       "shutdownTimeoutMs",
+      localConfig.shutdownTimeoutMs,
       env.OPENCODE_PLAYWRIGHT_SHUTDOWN_TIMEOUT_MS,
       5_000,
     ),
+    windowsServiceUrl,
   }
 }
 
 export function proxyTokenReference(
   options: PluginOptions = {},
   env: NodeJS.ProcessEnv = process.env,
+  localConfig: LocalConfig = {},
 ): string {
   const value =
     optionString(options, "proxyTokenFile") ??
+    localConfig.proxyTokenFile ??
     env.OPENCODE_PLAYWRIGHT_PROXY_TOKEN_FILE ??
     ".secrets/playwright-mcp-proxy-key"
   if (isAbsolute(value)) return value
@@ -249,6 +351,49 @@ export function resolveNodeExecutable(
 
 const MCP_PROBE_TIMEOUT_MS = 1_000
 const MCP_PROTOCOL_VERSION = "2025-03-26"
+const WSL_NETWORKING_MODE_TIMEOUT_MS = 1_000
+const WSL_NETWORKING_MODE_MAX_BUFFER_BYTES = 1_024
+
+type WslNetworkingModeCommandOptions = {
+  encoding: "utf8"
+  timeout: number
+  maxBuffer: number
+  windowsHide: true
+  stdio: ["ignore", "pipe", "pipe"]
+}
+
+type WslNetworkingModeCommandResult = {
+  status: number | null
+  stdout?: string | null
+  stderr?: string | null
+  error?: unknown
+}
+
+type WslNetworkingModeExecutor = (
+  command: "wslinfo",
+  args: ["--networking-mode"],
+  options: WslNetworkingModeCommandOptions,
+) => WslNetworkingModeCommandResult
+
+export function detectWslNetworkingMode(
+  execute: WslNetworkingModeExecutor = (command, args, options) => spawnSync(command, args, options),
+): "nat" | "mirrored" | undefined {
+  try {
+    const result = execute("wslinfo", ["--networking-mode"], {
+      encoding: "utf8",
+      timeout: WSL_NETWORKING_MODE_TIMEOUT_MS,
+      maxBuffer: WSL_NETWORKING_MODE_MAX_BUFFER_BYTES,
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    })
+    if (result.error !== undefined || result.status !== 0) return undefined
+
+    const mode = result.stdout?.trim()
+    return mode === "nat" || mode === "mirrored" ? mode : undefined
+  } catch {
+    return undefined
+  }
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null
@@ -294,11 +439,19 @@ async function readMcpResponse(response: Response): Promise<unknown> {
 export async function probeMcp(
   endpoint: URL,
   bearerToken?: string,
+  signal?: AbortSignal,
 ): Promise<{ mcp: boolean; extension: boolean }> {
+  if (signal?.aborted) return { mcp: false, extension: false }
+
   const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(), MCP_PROBE_TIMEOUT_MS)
+  const abortProbe = () => controller.abort()
+  signal?.addEventListener("abort", abortProbe, { once: true })
+  if (signal?.aborted) controller.abort()
+  let timeout: ReturnType<typeof setTimeout> | undefined
   const authorization = bearerToken === undefined ? {} : { Authorization: `Bearer ${bearerToken}` }
   try {
+    if (controller.signal.aborted) return { mcp: false, extension: false }
+    timeout = setTimeout(() => controller.abort(), MCP_PROBE_TIMEOUT_MS)
     const response = await fetch(endpoint, {
       method: "POST",
       headers: {
@@ -354,13 +507,15 @@ export async function probeMcp(
   } catch {
     return { mcp: false, extension: false }
   } finally {
-    clearTimeout(timeout)
+    if (timeout !== undefined) clearTimeout(timeout)
+    signal?.removeEventListener("abort", abortProbe)
   }
 }
 
-export function createBridge(options: PluginOptions = {}): PlaywrightBridge {
+export function createBridge(options: PluginOptions = {}, localConfig: LocalConfig = {}): PlaywrightBridge {
   const env = process.env
   const configDir = configDirectory(env)
+  const config = bridgeConfigFromOptions(options, configDir, env, localConfig)
   const resolver = createRequire(import.meta.url)
   const nodeExecutable = (() => {
     try {
@@ -375,7 +530,10 @@ export function createBridge(options: PluginOptions = {}): PlaywrightBridge {
     const probe = async (address: string): Promise<boolean> => {
       const controller = new AbortController()
       const timeout = setTimeout(() => controller.abort(), 500)
-      const formattedAddress = address.includes(":") ? `[${address}]` : address
+      const unwrappedAddress = address.startsWith("[") && address.endsWith("]")
+        ? address.slice(1, -1)
+        : address
+      const formattedAddress = unwrappedAddress.includes(":") ? `[${unwrappedAddress}]` : unwrappedAddress
       try {
         const response = await fetch(`http://${formattedAddress}:${port}`, {
           method: "HEAD",
@@ -451,16 +609,19 @@ export function createBridge(options: PluginOptions = {}): PlaywrightBridge {
     },
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     probeMcp,
+    getWslNetworkingMode: detectWslNetworkingMode,
     requestOwnerLifecycle:
       typeof options.ownerLifecycleRequest === "function"
         ? (options.ownerLifecycleRequest as OwnerLifecycleRequester)
         : process.platform !== "win32"
-          ? (action) => Promise.resolve().then(() => requestWindowsOwnerLifecycle(action, env, configDir))
+          ? (action) => Promise.resolve().then(() =>
+            requestWindowsOwnerLifecycle(action, env, configDir, undefined, config.windowsServiceUrl),
+          )
         : undefined,
     now: () => new Date(),
   }
 
-  return new PlaywrightBridge(dependencies, bridgeConfigFromOptions(options, configDir, env))
+  return new PlaywrightBridge(dependencies, config)
 }
 
 function registration(status: BridgeStatus, proxyToken?: string): Record<string, unknown> {
@@ -569,6 +730,37 @@ async function startBridge(bridge: PlaywrightBridge): Promise<BridgeStatus> {
   }
 }
 
+function automaticRetryVersion(bridge: PlaywrightBridge): number {
+  return automaticRetryStates.get(bridge)?.version ?? 0
+}
+
+function automaticRetriesSuspended(bridge: PlaywrightBridge): boolean {
+  return automaticRetryStates.get(bridge)?.suspended ?? false
+}
+
+function invalidateAutomaticRetries(
+  bridge: PlaywrightBridge,
+  suspended = automaticRetriesSuspended(bridge),
+): void {
+  automaticRetryStates.set(bridge, {
+    version: automaticRetryVersion(bridge) + 1,
+    suspended,
+  })
+}
+
+function retryWslProxy(bridge: PlaywrightBridge): Promise<BridgeStatus> {
+  const running = inFlightWslProxyRetries.get(bridge)
+  if (running !== undefined) return running
+
+  const retry = bridge.retryWslProxy()
+  inFlightWslProxyRetries.set(bridge, retry)
+  const clear = () => {
+    if (inFlightWslProxyRetries.get(bridge) === retry) inFlightWslProxyRetries.delete(bridge)
+  }
+  void retry.then(clear, clear)
+  return retry
+}
+
 function retainBridge(bridge: PlaywrightBridge): () => Promise<void> {
   const current = bridgeReferences.get(bridge)
   if (current === undefined) {
@@ -608,6 +800,8 @@ export async function installBridge(
   let retryTimer: ReturnType<typeof setInterval> | undefined
   let retryAttempts = 0
   let retryLimit: number | undefined
+  let retryInFlight = false
+  let retryGeneration = 0
   let cleaned = false
   const instructionDetails = setupDetails ?? (() => {
     const configDir = configDirectory()
@@ -622,6 +816,7 @@ export async function installBridge(
   })()
 
   const stopRetry = () => {
+    retryGeneration++
     if (retryTimer !== undefined) {
       clearInterval(retryTimer)
       retryTimer = undefined
@@ -632,34 +827,55 @@ export async function installBridge(
 
   const retryRegistration = (limit?: number) => {
     if (retryTimer !== undefined) return
+    if (automaticRetriesSuspended(bridge)) invalidateAutomaticRetries(bridge, false)
     retryLimit = limit
+    const generation = retryGeneration
     retryTimer = setInterval(() => {
-      if (cleaned) return
+      if (cleaned || generation !== retryGeneration || automaticRetriesSuspended(bridge)) return
+      if (retryInFlight) return
       if (retryLimit !== undefined && retryAttempts >= retryLimit) {
         stopRetry()
         return
       }
+      retryInFlight = true
       retryAttempts++
-      void startBridge(bridge)
+      const bridgeVersion = automaticRetryVersion(bridge)
+      const retry = bridge.status().mode === "wsl-client"
+        ? retryWslProxy(bridge)
+        : startBridge(bridge)
+      void retry
         .then(async (next) => {
-          if (cleaned) return
-          await reloadRegistration(next)
-          if (next.state === "ready") stopRetry()
+          const isCurrent = () =>
+            !cleaned && generation === retryGeneration && bridgeVersion === automaticRetryVersion(bridge)
+          if (!isCurrent()) return
+          await reloadRegistration(next, isCurrent)
+          if (isCurrent() && next.state === "ready") stopRetry()
         })
         .catch(() => undefined)
+        .finally(() => {
+          retryInFlight = false
+        })
     }, 2_000)
   }
 
-  const reloadRegistration = (status: BridgeStatus): Promise<void> => {
+  const reloadRegistration = (status: BridgeStatus, isCurrent: () => boolean = () => true): Promise<void> => {
+    if (!isCurrent()) return Promise.resolve()
     desiredStatus = status
     const operation = mcpOperation.catch(() => undefined).then(async () => {
+      if (!isCurrent()) return
       if (mcpRegistration !== undefined) {
         await mcpRegistration.dispose()
         mcpRegistration = undefined
       }
-      mcpRegistration = await ctx.mcp.transform((editor) => {
+      if (!isCurrent()) return
+      const registrationHandle = await ctx.mcp.transform((editor) => {
         editor.set("playwright", registration(desiredStatus ?? status, proxyToken) as never)
       })
+      if (!isCurrent()) {
+        await registrationHandle.dispose()
+        return
+      }
+      mcpRegistration = registrationHandle
       await ctx.mcp.reload()
     })
     mcpOperation = operation
@@ -722,10 +938,16 @@ export async function installBridge(
         description: "Start the Playwright bridge",
         execute: async ({ sessionID }) => {
           stopRetry()
+          invalidateAutomaticRetries(bridge, true)
           const next = await startBridge(bridge)
           await reloadRegistration(next)
-          if (next.mode === "wsl-client" && next.state !== "ready") retryRegistration()
-          else if (needsOwnerStartupRetry(next)) retryRegistration(5)
+          if (next.mode === "wsl-client" && next.state !== "ready") {
+            invalidateAutomaticRetries(bridge, false)
+            retryRegistration()
+          } else if (needsOwnerStartupRetry(next)) {
+            invalidateAutomaticRetries(bridge, false)
+            retryRegistration(5)
+          }
           await emitStatus(ctx, sessionID, next)
         },
       })
@@ -734,6 +956,7 @@ export async function installBridge(
         description: "Stop the Playwright bridge",
         execute: async ({ sessionID }) => {
           stopRetry()
+          invalidateAutomaticRetries(bridge, true)
           await removeRegistration()
           await bridge.stop()
           await emitStatus(ctx, sessionID, bridge.status())
@@ -744,11 +967,17 @@ export async function installBridge(
         description: "Restart the Playwright bridge",
         execute: async ({ sessionID }) => {
           stopRetry()
+          invalidateAutomaticRetries(bridge, true)
           await removeRegistration()
           const next = await bridge.restart()
           await reloadRegistration(next)
-          if (next.mode === "wsl-client" && next.state !== "ready") retryRegistration()
-          else if (needsOwnerStartupRetry(next)) retryRegistration(5)
+          if (next.mode === "wsl-client" && next.state !== "ready") {
+            invalidateAutomaticRetries(bridge, false)
+            retryRegistration()
+          } else if (needsOwnerStartupRetry(next)) {
+            invalidateAutomaticRetries(bridge, false)
+            retryRegistration(5)
+          }
           await emitStatus(ctx, sessionID, next)
         },
       })
@@ -799,6 +1028,7 @@ export async function installBridge(
       if (cleaned) return
       cleaned = true
       stopRetry()
+      invalidateAutomaticRetries(bridge)
       let failure: unknown
       try {
         await removeRegistration()
@@ -832,6 +1062,7 @@ export async function installBridge(
     if (typeof error === "object" && error !== null) loggedSetupErrors.add(error)
     cleaned = true
     stopRetry()
+    invalidateAutomaticRetries(bridge)
     try {
       await removeRegistration()
     } catch {
@@ -860,34 +1091,38 @@ export async function installBridge(
 export default Plugin.define({
   id: "playwright-bridge",
   async setup(ctx) {
-    const configDir = configDirectory()
-    const config = bridgeConfigFromOptions(ctx.options, configDir)
     const log = createDiagnosticLogger()
-    if (sharedBridge === undefined) {
-      sharedBridge = createBridge(ctx.options)
-      if (process.platform !== "win32") {
-        try {
-          const configDir = configDirectory()
-          const tokenFile = bridgeConfigFromOptions(ctx.options, configDir).proxyTokenFile
-          sharedProxyToken = tokenFile === undefined ? undefined : readFileSync(tokenFile, "utf8").trim() || undefined
-        } catch {
-          sharedProxyToken = undefined
+    try {
+      const configDir = configDirectory()
+      const localConfig = loadLocalConfig(configDir)
+      const config = bridgeConfigFromOptions(ctx.options, configDir, process.env, localConfig)
+      if (sharedBridge === undefined) {
+        sharedBridge = createBridge(ctx.options, localConfig)
+        if (process.platform !== "win32") {
+          try {
+            const tokenFile = config.proxyTokenFile
+            sharedProxyToken = tokenFile === undefined ? undefined : readFileSync(tokenFile, "utf8").trim() || undefined
+          } catch {
+            sharedProxyToken = undefined
+          }
         }
       }
-    }
-    try {
       const cleanup = await installBridge(ctx, sharedBridge, sharedProxyToken, log, {
         configDir,
         extensionTokenFile: config.extensionTokenFile!,
         proxyTokenFile: config.proxyTokenFile!,
         customProxyTokenPath:
           optionString(ctx.options, "proxyTokenFile") !== undefined ||
+          localConfig.proxyTokenFile !== undefined ||
           process.env.OPENCODE_PLAYWRIGHT_PROXY_TOKEN_FILE !== undefined,
         logPath: diagnosticLogPath(),
       })
       return cleanup
     } catch (error) {
-      if (typeof error !== "object" || error === null || !loggedSetupErrors.has(error)) {
+      if (error instanceof LocalConfigError) {
+        log(`Local config failed: ${error.message}`)
+        loggedSetupErrors.add(error)
+      } else if (typeof error !== "object" || error === null || !loggedSetupErrors.has(error)) {
         log(`Setup failed: ${diagnosticError(error)}`)
       }
       throw error

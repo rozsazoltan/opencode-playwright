@@ -105,6 +105,26 @@ describe("Windows default proxy token", () => {
     expect(existsSync(defaultTokenPath)).toBe(false)
   })
 
+  test("local config custom proxy token path disables default token generation", async () => {
+    const { configDir, defaultTokenPath, dependencies } = fixture()
+    const customPath = join(configDir, ".secrets", "configured-proxy-key")
+    dependencies.fileExists = (path) => path === customPath ? false : path === defaultTokenPath ? false : true
+    const config = bridgeConfigFromOptions({}, configDir, dependencies.env, {
+      proxyTokenFile: ".secrets/configured-proxy-key",
+    })
+
+    expect(config).toMatchObject({
+      proxyTokenFile: customPath,
+      autoGenerateProxyToken: false,
+    })
+    const status = await new PlaywrightBridge(dependencies, config).start()
+
+    expect(status.state).toBe("failed")
+    expect(status.reason).toBe("Playwright proxy token file is missing")
+    expect(existsSync(customPath)).toBe(false)
+    expect(existsSync(defaultTokenPath)).toBe(false)
+  })
+
   test("does not expose filesystem errors while generating the default key", async () => {
     const { configDir, dependencies } = fixture()
     const config = bridgeConfigFromOptions({}, configDir, dependencies.env)
