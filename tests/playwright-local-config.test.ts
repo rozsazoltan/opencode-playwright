@@ -3,7 +3,7 @@ import * as fs from "node:fs"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import plugin, { configDirectory } from "../src/index"
+import plugin, { bridgeConfigFromOptions, configDirectory } from "../src/index"
 import {
   loadLocalConfig,
   LocalConfigError,
@@ -82,12 +82,179 @@ describe("local plugin config", () => {
     const error = expectLocalConfigError(
       () => loadLocalConfig(configDir),
       path,
-      "must contain strict JSON for an empty object ({})",
+      "must contain strict JSON with only supported keys and valid values",
     )
 
     expect(error.message).not.toContain("SECRET_MARKER")
     expect(error.message).not.toContain("__proto__")
     expect(fs.readFileSync(path, "utf8")).toBe(contents)
+  })
+
+  test("accepts supported non-secret settings and rejects unknown, secret, and invalid values safely", () => {
+    const configDir = temporaryDirectory()
+    const path = localConfigPath(configDir)
+    const contents = JSON.stringify({
+      playwrightHost: "127.0.0.1",
+      playwrightPort: 9001,
+      proxyHost: "0.0.0.0",
+      proxyPort: 9002,
+      windowsHost: "172.20.0.1",
+      browserExecutable: "C:\\Brave\\brave.exe",
+      profileDirName: "Profile 2",
+      extensionTokenFile: ".secrets/extension-token",
+      proxyTokenFile: ".secrets/proxy-token",
+      startupTimeoutMs: 3_000,
+      startupPollMs: 50,
+      shutdownTimeoutMs: 2_000,
+      windowsServiceUrl: "http://127.0.0.1:5000",
+    })
+    fs.writeFileSync(path, contents)
+
+    expect(loadLocalConfig(configDir)).toEqual(JSON.parse(contents))
+    expect(fs.readFileSync(path, "utf8")).toBe(contents)
+
+    for (const invalid of [
+      '{"OPENCODE_PLAYWRIGHT_EXTENSION_TOKEN":"secret-marker"}',
+      '{"OPENCODE_SERVER_PASSWORD":"secret-marker"}',
+      '{"playwrightPort":"8931"}',
+      '{"playwrightPort":65536}',
+      '{"playwrightPort":8931,"proxyPort":8931}',
+      '{"startupPollMs":0}',
+      '{"startupTimeoutMs":2147483648}',
+      '{"playwrightHost":"0.0.0.0"}',
+      '{"playwrightHost":"[::1]"}',
+      '{"playwrightHost":"127.000.0.1"}',
+      '{"proxyHost":"[::]"}',
+      '{"windowsHost":"http://windows-host"}',
+      '{"windowsServiceUrl":"file:///tmp/service"}',
+      '{"windowsServiceUrl":"http://owner:password@localhost"}',
+      '{"windowsServiceUrl":"http://remote-owner:5000"}',
+      '{"windowsServiceUrl":"http://localhost/api"}',
+      '{"windowsServiceUrl":"http://localhost/.."}',
+      '{"windowsServiceUrl":"http://localhost?"}',
+      '{"windowsServiceUrl":"http:\\\\localhost"}',
+      '{"windowsServiceUrl":"http://localhost:65536"}',
+      '{"proxyTokenFile":""}',
+    ]) {
+      fs.writeFileSync(path, invalid)
+      const error = expectLocalConfigError(
+        () => loadLocalConfig(configDir),
+        path,
+        "must contain strict JSON with only supported keys and valid values",
+      )
+      expect(error.message).not.toContain("secret-marker")
+      expect(fs.readFileSync(path, "utf8")).toBe(invalid)
+    }
+  })
+
+  test("uses plugin options before local config, then environment values and defaults", () => {
+    const configDir = temporaryDirectory()
+    const localConfig = {
+      playwrightPort: 9201,
+      playwrightHost: "127.0.0.2",
+      proxyHost: "127.0.0.1",
+      proxyPort: 9202,
+      startupPollMs: 70,
+      windowsHost: "172.20.0.2",
+      browserExecutable: "C:\\Local\\brave.exe",
+      profileDirName: "Profile 3",
+      extensionTokenFile: ".secrets/local-extension-key",
+      proxyTokenFile: ".secrets/local-proxy-key",
+      startupTimeoutMs: 4_000,
+      shutdownTimeoutMs: 3_000,
+      windowsServiceUrl: "https://local-owner:5000",
+    }
+    const environment = {
+      OPENCODE_PLAYWRIGHT_HOST: "127.0.0.3",
+      OPENCODE_PLAYWRIGHT_PORT: "9301",
+      OPENCODE_PLAYWRIGHT_PROXY_HOST: "127.0.0.2",
+      OPENCODE_PLAYWRIGHT_PROXY_PORT: "9302",
+      OPENCODE_PLAYWRIGHT_STARTUP_POLL_MS: "80",
+      OPENCODE_PLAYWRIGHT_WINDOWS_HOST: "172.20.0.3",
+      OPENCODE_PLAYWRIGHT_EXECUTABLE_PATH: "C:\\Environment\\brave.exe",
+      OPENCODE_PLAYWRIGHT_PROFILE_DIR_NAME: "Profile 4",
+      OPENCODE_PLAYWRIGHT_EXTENSION_TOKEN_FILE: ".secrets/environment-extension-key",
+      OPENCODE_PLAYWRIGHT_PROXY_TOKEN_FILE: ".secrets/environment-proxy-key",
+      OPENCODE_PLAYWRIGHT_STARTUP_TIMEOUT_MS: "5000",
+      OPENCODE_PLAYWRIGHT_SHUTDOWN_TIMEOUT_MS: "4000",
+      OPENCODE_PLAYWRIGHT_WINDOWS_SERVICE_URL: "https://environment-owner:4000",
+    }
+
+    expect(bridgeConfigFromOptions({}, configDir, environment, localConfig)).toMatchObject({
+      playwrightHost: "127.0.0.2",
+      playwrightPort: 9201,
+      proxyHost: "127.0.0.1",
+      proxyPort: 9202,
+      startupPollMs: 70,
+      windowsHost: "172.20.0.2",
+      browserExecutable: "C:\\Local\\brave.exe",
+      profileDirName: "Profile 3",
+      extensionTokenFile: join(configDir, ".secrets/local-extension-key"),
+      proxyTokenFile: join(configDir, ".secrets/local-proxy-key"),
+      startupTimeoutMs: 4_000,
+      shutdownTimeoutMs: 3_000,
+      windowsServiceUrl: "https://local-owner:5000",
+      autoGenerateProxyToken: false,
+    })
+    expect(
+      bridgeConfigFromOptions(
+        { playwrightPort: 9401, windowsServiceUrl: "https://option-owner:6000" },
+        configDir,
+        environment,
+        localConfig,
+      ),
+    ).toMatchObject({ playwrightPort: 9401, windowsServiceUrl: "https://option-owner:6000" })
+    expect(bridgeConfigFromOptions({}, configDir, environment)).toMatchObject({
+      playwrightHost: "127.0.0.3",
+      playwrightPort: 9301,
+      proxyHost: "127.0.0.2",
+      proxyPort: 9302,
+      startupPollMs: 80,
+      windowsHost: "172.20.0.3",
+      browserExecutable: "C:\\Environment\\brave.exe",
+      profileDirName: "Profile 4",
+      extensionTokenFile: join(configDir, ".secrets/environment-extension-key"),
+      proxyTokenFile: join(configDir, ".secrets/environment-proxy-key"),
+      startupTimeoutMs: 5_000,
+      shutdownTimeoutMs: 4_000,
+      windowsServiceUrl: "https://environment-owner:4000",
+      autoGenerateProxyToken: false,
+    })
+    expect(bridgeConfigFromOptions({}, configDir, {})).toMatchObject({
+      playwrightHost: "localhost",
+      playwrightPort: 8931,
+      proxyHost: "0.0.0.0",
+      proxyPort: 8932,
+      startupPollMs: 100,
+      startupTimeoutMs: 15_000,
+      shutdownTimeoutMs: 5_000,
+      browserExecutable: "C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe",
+      profileDirName: "Default",
+      extensionTokenFile: join(configDir, ".secrets/playwright-key"),
+      proxyTokenFile: join(configDir, ".secrets/playwright-mcp-proxy-key"),
+      windowsServiceUrl: "http://127.0.0.1:49374",
+      autoGenerateProxyToken: true,
+    })
+
+    expect(() => bridgeConfigFromOptions({ playwrightPort: 9000, proxyPort: 9000 }, configDir, {}))
+      .toThrow("playwrightPort and proxyPort must be different")
+    expect(() => bridgeConfigFromOptions({}, configDir, {
+      OPENCODE_PLAYWRIGHT_PORT: "9000",
+      OPENCODE_PLAYWRIGHT_PROXY_PORT: "9000",
+    })).toThrow("playwrightPort and proxyPort must be different")
+    expect(() => bridgeConfigFromOptions({}, configDir, {}, {
+      playwrightPort: 9000,
+      proxyPort: 9000,
+    })).toThrow("playwrightPort and proxyPort must be different")
+    expect(() => bridgeConfigFromOptions({ windowsServiceUrl: "http://remote-owner:5000" }, configDir, {}))
+      .toThrow("windowsServiceUrl must use HTTPS unless it targets loopback")
+    expect(() => bridgeConfigFromOptions({}, configDir, {
+      OPENCODE_PLAYWRIGHT_WINDOWS_SERVICE_URL: "http://environment-owner:5000",
+    })).toThrow("windowsServiceUrl must use HTTPS unless it targets loopback")
+    expect(bridgeConfigFromOptions({ windowsServiceUrl: "http://127.0.0.2:5000" }, configDir, {}))
+      .toMatchObject({ windowsServiceUrl: "http://127.0.0.2:5000" })
+    expect(bridgeConfigFromOptions({ windowsServiceUrl: "https://remote-owner:5000" }, configDir, {}))
+      .toMatchObject({ windowsServiceUrl: "https://remote-owner:5000" })
   })
 
   test("creates default config through complete atomic publication with private permissions", () => {
@@ -231,7 +398,7 @@ describe("local plugin config", () => {
     const error = expectLocalConfigError(
       () => loadLocalConfig(configDir, adapter),
       path,
-      "must contain strict JSON for an empty object ({})",
+      "must contain strict JSON with only supported keys and valid values",
     )
     expect(reads).toBe(2)
     expect(error.message).not.toContain("SECRET_MARKER")
@@ -382,7 +549,7 @@ describe("local plugin config", () => {
     const error = expectLocalConfigError(
       () => loadLocalConfig(configDir, adapter),
       path,
-      "must contain strict JSON for an empty object ({})",
+      "must contain strict JSON with only supported keys and valid values",
     )
     expect(error.message).not.toContain("SECRET_MARKER")
     expect(fs.readFileSync(path, "utf8")).toBe(winnerBytes)
@@ -501,14 +668,14 @@ describe("local plugin config", () => {
       fs.rmdirSync(path)
       fs.writeFileSync(path, '{"secret":"SECRET_MARKER"}')
       await expect(setup(context)).rejects.toMatchObject({
-        reason: "must contain strict JSON for an empty object ({})",
+        reason: "must contain strict JSON with only supported keys and valid values",
       })
 
       expect(effects).toBe(0)
       const diagnosticPath = join(diagnosticsDir, "opencode", "log", "opencode-playwright-bridge.log")
       const diagnostics = fs.readFileSync(diagnosticPath, "utf8")
       expect(diagnostics).toContain(path)
-      expect(diagnostics).toContain("must contain strict JSON for an empty object ({})")
+      expect(diagnostics).toContain("must contain strict JSON with only supported keys and valid values")
       expect(diagnostics).not.toContain("SECRET_MARKER")
     } finally {
       if (previousConfigDir === undefined) delete process.env.OPENCODE_CONFIG_DIR
